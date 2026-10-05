@@ -1,0 +1,31 @@
+Muse on a Sony PSP
+
+This project is not affiliated with, endorsed by, or supported by Sony, Meta,
+or OpenAI. PSP and PlayStation are trademarks of Sony Interactive
+Entertainment. Muse is a product of Meta.
+
+It builds on the following work.
+
+Muse Gadget SDK
+  https://github.com/facebookincubator/muse-gadget-sdk
+  Copyright (c) Meta Platforms, Inc. and affiliates. Apache License 2.0.
+  The client in muse/ is a C port of the SDK's Linux client and follows its
+  protocol.
+
+SVOX Pico text to speech
+  third_party/pico and assets/tts
+  Copyright (C) 2008-2009 SVOX AG. Apache License 2.0.
+  Taken from https://github.com/naggety/picotts. One file is changed,
+  picopltf.h, to take the byte order from the compiler. See
+  third_party/pico/README.txt.
+
+Nunito
+  assets/fonts
+  SIL Open Font License 1.1. See assets/fonts/OFL.txt.
+
+The PSP toolchain and the libraries it provides, which the app links against
+and which are not included here: pspdev, SDL2, SDL2_image, SDL2_ttf, mbedTLS,
+cJSON, FreeType, HarfBuzz, libpng, libjpeg and zlib, each under its own
+licence.
+
+No avatar artwork is included. You supply your own.

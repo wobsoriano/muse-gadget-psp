@@ -1,0 +1,9 @@
+{
+  "provider": "openai",
+  "url": "https://api.openai.com/v1/audio/speech",
+  "model": "gpt-4o-mini-tts",
+  "voice": "alloy",
+  "instructions": "Warm, friendly and a little playful, like a small cheerful companion. Natural pace.",
+  "response_format": "pcm",
+  "sample_rate": 24000
+}

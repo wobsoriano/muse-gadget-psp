@@ -1,0 +1,27 @@
+# Secrets and pairings. Never commit these.
+state/
+state.*/
+.openai_key
+*.key
+
+# The avatar is not ours to publish. These are made from your own video by
+# tools/pack_video.py and tools/make_icon.py.
+assets/clip/
+assets/menu/
+app/clip_table.h
+
+# The PSP toolchain and everything built
+toolchain/
+build*/
+dist/
+
+# Local leftovers
+voice-samples/
+__pycache__/
+.pytest_cache/
+.DS_Store
+link_trace.txt
+SDL_Log.txt
+
+# Your Muse SDK token, if you keep it here for tools/install.py
+.sdk_token
