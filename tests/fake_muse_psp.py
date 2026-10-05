@@ -1,6 +1,10 @@
 """A local stand-in for the Muse API and VM, built on Meta's reference code.
 
-A copy of muse-tufty/tests/fake_muse.py, extended for the C library's test.
+It uses the Muse Gadget SDK's own Python code for the server's half of the
+protocol, so the C client is tested against the reference, not against itself.
+Clone https://github.com/facebookincubator/muse-gadget-sdk into
+vendor/muse-gadget-sdk, or point MUSE_GADGET_SDK at a checkout.
+
 Serves the device API over plain HTTP and the Noise WebSocket on a second
 port, then walks one scripted session: register, invoke, chats, a large
 invoke, unpair. Prints one JSON line with the two ports when ready and one
@@ -16,11 +20,15 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import pathlib
 import sys
 
-TUFTY = pathlib.Path(__file__).resolve().parent.parent.parent / "muse-tufty"
-sys.path.insert(0, str(TUFTY / "vendor" / "muse-gadget-sdk" / "linux" / "src"))
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+SDK = pathlib.Path(os.environ.get("MUSE_GADGET_SDK") or ROOT / "vendor" / "muse-gadget-sdk")
+if not (SDK / "linux" / "src" / "musegadget").is_dir():
+    sys.exit("Muse Gadget SDK not found at %s. Clone it there or set MUSE_GADGET_SDK." % SDK)
+sys.path.insert(0, str(SDK / "linux" / "src"))
 
 from websockets.asyncio.server import serve  # noqa: E402
 

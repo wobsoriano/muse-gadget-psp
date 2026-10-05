@@ -1,5 +1,5 @@
 /* The library's service loop against tests/fake_muse_psp.py, over real
- * sockets. The C counterpart of muse-tufty/tests/device_session.py.
+ * sockets.
  *
  *     host_session API_PORT VM_PORT [--voice]
  *

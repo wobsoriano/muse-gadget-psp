@@ -1,6 +1,6 @@
 /* Client side of the Muse Noise session: the Noise_XX_25519_AESGCM_SHA256
  * initiator, chunked transport frames and the service envelopes. Ported from
- * the Muse Gadget SDK's noise package by way of musebadge/noise.py. */
+ * the Muse Gadget SDK's noise package by way of an earlier Python port. */
 #include "muse_internal.h"
 
 #include <stdlib.h>

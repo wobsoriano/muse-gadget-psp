@@ -25,3 +25,6 @@ SDL_Log.txt
 
 # Your Muse SDK token, if you keep it here for tools/install.py
 .sdk_token
+
+# A checkout of the Muse Gadget SDK, used by the tests
+vendor/

@@ -1,5 +1,5 @@
 /* The Muse device API: leased VM lookup and token rotation. Ported from the
- * Muse Gadget SDK's muse_api.py by way of musebadge/api.py. */
+ * Muse Gadget SDK's muse_api.py by way of an earlier Python port. */
 #include "muse_internal.h"
 
 #include <stdlib.h>

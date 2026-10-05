@@ -107,7 +107,7 @@ int muse_tls_init(muse_tls *tls, bool ignore_cert_dates, muse_log log);
 void muse_tls_free(muse_tls *tls);
 int muse_tls_random(muse_tls *tls, void *buf, size_t len);
 
-/* The root certificate, DER, from musebadge/digicert_global_root_g2.der. */
+/* The root certificate, DER: DigiCert Global Root G2. */
 extern const unsigned char muse_digicert_global_root_g2_der[];
 extern const size_t muse_digicert_global_root_g2_der_len;
 /* dns.c. muse_dns_query returns the packet's length, or 0 when the name does

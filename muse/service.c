@@ -1,5 +1,5 @@
 /* Keeps a paired device connected to its Muse. Ported from the Muse Gadget
- * SDK's service.py by way of musebadge/service.py: each round rotates the
+ * SDK's service.py by way of an earlier Python port: each round rotates the
  * device token when due, fetches the leased VM, serves one session, then
  * backs off. Pairing itself lives outside the library, so an unpaired device
  * ends the run. */

@@ -7,10 +7,10 @@ Put the PSP in USB Connection mode first. This copies the built app and its
 files to PSP/GAME/Muse on the stick and ejects it. Run it again after every
 rebuild.
 
-The pairing is only ever copied once. From then on the PSP renews its own
-tokens and saves them on the stick, so the copy on the stick is the live one
-and the copy in state/ here goes stale. Overwriting the stick's pairing with
-a stale one would unpair the PSP, so an existing pairing is left alone.
+This copies the pairing only once. From then on the PSP renews its own tokens
+and saves them on the stick, so the copy on the stick is the live one and the
+copy in state/ here goes stale. Overwriting the stick's pairing with a stale
+one would unpair the PSP, so this leaves an existing pairing alone.
 """
 import argparse
 import pathlib

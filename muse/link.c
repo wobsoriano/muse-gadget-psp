@@ -1,5 +1,5 @@
 /* One control session with a Muse VM. Ported from the Muse Gadget SDK's
- * link_client.py by way of musebadge/link.py, onto one thread: the serve
+ * link_client.py by way of an earlier Python port, onto one thread: the serve
  * loop reads in short slices and runs the keepalive and the chat turn in
  * between, where the Python used tasks. */
 #include "muse_internal.h"
