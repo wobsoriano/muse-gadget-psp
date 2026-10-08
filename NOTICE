@@ -9,23 +9,27 @@ It builds on the following work.
 Muse Gadget SDK
   https://github.com/facebookincubator/muse-gadget-sdk
   Copyright (c) Meta Platforms, Inc. and affiliates. Apache License 2.0.
-  The client in muse/ is a C port of the SDK's Linux client and follows its
-  protocol.
+  The client in link/ follows the protocol of the SDK's Linux client, and the
+  tests run against a fake Muse built on the SDK's Python code.
 
-SVOX Pico text to speech
-  third_party/pico and assets/tts
-  Copyright (C) 2008-2009 SVOX AG. Apache License 2.0.
-  Taken from https://github.com/naggety/picotts. One file is changed,
-  picopltf.h, to take the byte order from the compiler. See
-  third_party/pico/README.txt.
+  The SDK's Jollybot avatar is not under that licence and is not included
+  here. tools/avatar.sh builds it on your own machine from your own clone of
+  the SDK.
 
-Nunito
-  assets/fonts
-  SIL Open Font License 1.1. See assets/fonts/OFL.txt.
+rust-psp
+  vendor/psp
+  https://github.com/overdrivenpotato/rust-psp
+  MIT License. This is version 0.3.14 of the psp crate with one addition in
+  src/sys/net.rs, the sceNetInetPoll call and its SceNetInetPollfd type,
+  which the upstream crate does not declare. The font in src/status.rs is
+  that crate's msxfont.bin.
 
-The PSP toolchain and the libraries it provides, which the app links against
-and which are not included here: pspdev, SDL2, SDL2_image, SDL2_ttf, mbedTLS,
-cJSON, FreeType, HarfBuzz, libpng, libjpeg and zlib, each under its own
-licence.
+Root certificates
+  link/certs
+  DigiCert Global Root G2 and GTS Root R4, the public certificates of two
+  certificate authorities, as shipped in operating system trust stores.
 
-No avatar artwork is included. You supply your own.
+The Rust crates the app links against are fetched by Cargo and are not
+included here. They are rustls, rustls-rustcrypto and the RustCrypto crates
+beneath it, serde and serde_json, getrandom, spin and zeroize, each under its
+own licence.

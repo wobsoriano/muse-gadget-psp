@@ -3,8 +3,8 @@
 
     tools/install.py [--volume /Volumes/NAME] [--no-eject]
 
-Put the PSP in USB Connection mode first. This copies the built app and its
-files to PSP/GAME/Muse on the stick and ejects it. Run it again after every
+Put the PSP in USB Connection mode first. This copies the built app and the
+avatar to PSP/GAME/Muse on the stick and ejects it. Run it again after every
 rebuild.
 
 This copies the pairing only once. From then on the PSP renews its own tokens
@@ -19,8 +19,8 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-APP_FILES = ["commands.json", "voice.json"]
-APP_FOLDERS = {"assets/clip": "clip", "assets/fonts": "fonts", "assets/tts": "tts"}
+EBOOT = ROOT / "target" / "mipsel-sony-psp" / "release" / "EBOOT.PBP"
+AVATAR = ROOT / "assets" / "avatar" / "avatar.bin"
 PAIRING = ["identity.json", "pairing.json"]
 
 
@@ -45,28 +45,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--volume", help="the Memory Stick (default: the one mounted)")
     parser.add_argument("--sdk-token-file", help="your Muse SDK token (default: .sdk_token)")
-    parser.add_argument("--openai-key-file", help="an OpenAI key for the cloud voices (default: .openai_key)")
+    parser.add_argument("--openai-key-file", help="an OpenAI key for the voice (default: .openai_key)")
     parser.add_argument("--no-eject", action="store_true", help="leave the stick mounted")
     args = parser.parse_args()
 
-    eboot = ROOT / "build" / "EBOOT.PBP"
-    if not eboot.exists():
-        sys.exit("build/EBOOT.PBP is missing. Build the app first, see the README.")
-    if not any((ROOT / "assets" / "clip").glob("*.png")):
-        sys.exit("assets/clip has no avatar frames. Run tools/pack_video.py first, see the README.")
+    if not EBOOT.exists():
+        sys.exit("%s is missing. Build the app first, see the README." % EBOOT.relative_to(ROOT))
+    if not AVATAR.exists():
+        sys.exit("%s is missing. Run tools/avatar.sh first, see the README." % AVATAR.relative_to(ROOT))
 
     stick = find_stick(args.volume)
     target = stick / "PSP" / "GAME" / "Muse"
     state = target / "state"
     state.mkdir(parents=True, exist_ok=True)
 
-    shutil.copyfile(eboot, target / "EBOOT.PBP")
-    for name in APP_FILES:
-        shutil.copyfile(ROOT / name, target / name)
-    for source, name in APP_FOLDERS.items():
-        if (target / name).exists():
-            shutil.rmtree(target / name)
-        shutil.copytree(ROOT / source, target / name, ignore=shutil.ignore_patterns(".DS_Store", "._*"))
+    shutil.copyfile(EBOOT, target / "EBOOT.PBP")
+    shutil.copyfile(AVATAR, target / "avatar.bin")
 
     if (state / "pairing.json").exists():
         print("kept the pairing already on the stick")
@@ -75,7 +69,7 @@ def main():
             shutil.copyfile(ROOT / "state" / name, state / name)
         print("copied the pairing to the stick. The stick's copy is the live one from now on.")
     else:
-        print("no pairing yet. Muse will say it is not paired. Run tools/pair.py, then this again.")
+        print("no pairing yet. Muse will show as offline. Run tools/pair.py, then this again.")
 
     token = secret(args.sdk_token_file, ".sdk_token")
     if token:
@@ -83,13 +77,12 @@ def main():
     key = secret(args.openai_key_file, ".openai_key")
     if key:
         (state / "openai_key.txt").write_text(key)
-    print("cloud voices: %s" % ("on" if (state / "openai_key.txt").exists() else "off, the built-in voice will be used"))
+    print("voice: %s" % ("on" if (state / "openai_key.txt").exists() else "off, replies will not be spoken"))
 
     # macOS leaves "._" companions on FAT sticks, and the PSP lists them as corrupted data.
     for junk in target.rglob("._*"):
         junk.unlink()
-    size = sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
-    print("installed Muse to %s (%.1f MB)" % (target, size / 1e6))
+    print("installed Muse to %s" % target)
 
     if args.no_eject:
         return

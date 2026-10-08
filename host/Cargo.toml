@@ -1,0 +1,12 @@
+[package]
+name = "host-check"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The feature is for the session driver, which talks to tests/fake_muse.py.
+muse-link = { path = "../link", features = ["plaintext-for-tests"] }
+rustls = { version = "0.23.45", default-features = false }
+rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["alloc"] }
+serde_json = "1"
+sha2 = "0.10"

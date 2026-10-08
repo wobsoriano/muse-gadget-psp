@@ -1,0 +1,21 @@
+[package]
+name = "muse-gadget-psp"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+psp = "0.3.14"
+muse-link = { path = "link" }
+rustls = { version = "0.23.45", default-features = false }
+getrandom = { version = "0.2", features = ["custom"] }
+sha2 = { version = "0.10", default-features = false }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+# psp 0.3.14 plus sceNetInetPoll, which upstream does not declare.
+[patch.crates-io]
+psp = { path = "vendor/psp" }
+
+[profile.release]
+opt-level = "s"
+lto = true
