@@ -127,6 +127,9 @@ sure the date and time are set, and run **Muse** from the Game menu.
 
 Hold **R** to talk and release to send. Press **HOME** to quit.
 
+The app joins the first connection saved in the PSP's Network Settings. Hold
+**L** while it starts and it joins the second one.
+
 The corner of the screen shows whether the PSP can reach Muse, and the avatar
 shows what it is doing.
 
@@ -195,7 +198,9 @@ from a computer. `host-check` makes one HTTPS request, and `speech` speaks a
 sentence and saves the audio.
 
 The app writes `log.txt` next to itself on the Memory Stick, with a time on
-every line. Read that first when something misbehaves on the PSP.
+every line, and keeps the run before as `log-before.txt`. Read those first
+when something misbehaves on the PSP. The log names the Wi-Fi network and
+its signal strength, which is the first thing to check.
 
 ## Known limits
 
@@ -208,9 +213,11 @@ every line. Read that first when something misbehaves on the PSP.
   is the best source the PSP offers.
 - **No voice without OpenAI.** There is no offline voice and no text on
   screen. When the PSP cannot speak an answer, all you get is the hearts.
-- **Uploads are slow and sometimes stall.** A two second question takes
-  several seconds to reach Muse on my PSP. If one gets lost on the way,
-  the app asks it again once by itself, which takes longer still.
+- **It needs a strong Wi-Fi signal.** The PSP's radio is weak. Beside my
+  router a question reaches Muse in three to six seconds. Two rooms away
+  the same question stalled for a quarter of a minute or never arrived, and
+  joining Wi-Fi took 25 seconds where it had taken 4. If a question gets
+  lost on the way, the app asks it again once by itself.
 - **Long answers get cut short.** The PSP speaks about the first 420
   characters.
 - **Muse sends text, not audio.** OpenAI makes the voice.
