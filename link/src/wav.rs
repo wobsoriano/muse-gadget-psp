@@ -17,7 +17,8 @@ const QUIETEST: i32 = 600;
 fn level(samples: &[i16]) -> i32 {
     let mut counts = [0usize; 256];
     for sample in samples {
-        counts[(sample.unsigned_abs() >> 7) as usize] += 1;
+        // The most negative sample is one step past the most positive one.
+        counts[((sample.unsigned_abs() >> 7) as usize).min(counts.len() - 1)] += 1;
     }
     let mut above = samples.len() / 200;
     for (step, &count) in counts.iter().enumerate().rev() {
@@ -91,6 +92,14 @@ mod tests {
         let mut take = [2000i16; 6000];
         take[9..12].fill(32_767);
         assert_eq!(samples(&voice_note(&take, 22_050))[3], 32_767);
+    }
+
+    #[test]
+    fn every_possible_sample_is_accepted() {
+        let extremes = [i16::MIN, i16::MAX, 0, -1, 1];
+        let take: Vec<i16> = extremes.iter().cycle().take(6000).copied().collect();
+        assert_eq!(samples(&voice_note(&take, 22_050)).len(), 2000);
+        assert_eq!(samples(&voice_note(&[i16::MIN; 6000], 22_050))[5], -24_000);
     }
 
     #[test]
