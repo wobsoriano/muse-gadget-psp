@@ -13,8 +13,8 @@ own tokens.
 FOLDER must hold the two files a Muse gadget client keeps after pairing:
 
     identity.json   {"mac": "..."}
-    pairing.json    access_token, refresh_token, api_url_v2, noise_host,
-                    access_token_saved_at
+    pairing.json    access_token, refresh_token, access_token_saved_at, and
+                    optionally api_url_v2 and noise_host
 
 The Linux client in the Muse Gadget SDK writes exactly these, in
 /var/lib/musegadget or wherever MUSEGADGET_STATE_DIR points. See the README.
@@ -31,7 +31,8 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 STATE = ROOT / "state"
-PAIRING_FIELDS = ("access_token", "refresh_token", "api_url_v2")
+# The addresses may be empty. A client then uses Muse's own.
+PAIRING_FIELDS = ("access_token", "refresh_token")
 
 
 def load(folder, name):
