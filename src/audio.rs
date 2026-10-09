@@ -37,30 +37,6 @@ fn hear() -> &'static [i16; CHUNK] {
     }
 }
 
-/// The take as a WAV file at half the recording rate, which is plenty for
-/// speech and halves what goes over the air.
-fn wav(take: &[i16]) -> Vec<u8> {
-    // The microphone's level varies a great deal from one take to the next
-    // on a real PSP, so a quiet take is brought up before it is sent.
-    let peak = take.iter().map(|sample| sample.unsigned_abs() as i32).max().unwrap_or(0).max(600);
-    let rate = (RATE / 2) as u32;
-    let bytes = (take.len() / 2 * 2) as u32;
-    let mut file = Vec::with_capacity(44 + bytes as usize);
-    file.extend_from_slice(b"RIFF");
-    file.extend_from_slice(&(36 + bytes).to_le_bytes());
-    file.extend_from_slice(b"WAVEfmt ");
-    for field in [16, 0x0001_0001, rate, rate * 2, 0x0010_0002] {
-        file.extend_from_slice(&field.to_le_bytes());
-    }
-    file.extend_from_slice(b"data");
-    file.extend_from_slice(&bytes.to_le_bytes());
-    for pair in take.chunks_exact(2) {
-        let level = (pair[0] as i32 + pair[1] as i32) / 2 * 24_000 / peak;
-        file.extend_from_slice(&(level.clamp(-32_768, 32_767) as i16).to_le_bytes());
-    }
-    file
-}
-
 fn noise(samples: &[i16]) {
     let mut bytes = [0u8; CHUNK * 2];
     for (pair, sample) in bytes.chunks_mut(2).zip(samples) {
@@ -92,7 +68,7 @@ unsafe extern "C" fn run(_: usize, _: *mut c_void) -> i32 {
         let loudest = take.iter().map(|sample| sample.unsigned_abs()).max().unwrap_or(0);
         crate::say!("audio: took {} ms, loudest {} of 32768", take.len() * 1000 / RATE, loudest);
         if take.len() >= SHORTEST_TAKE {
-            muse::ask(wav(&take));
+            muse::ask(muse_link::wav::voice_note(&take, RATE as u32));
         }
         RECORDING.store(false, Ordering::Relaxed);
     }

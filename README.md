@@ -170,8 +170,9 @@ vendor/   the PSP library, with two small additions
   a WebSocket, runs a Noise XX handshake inside it, registers the PSP, and
   then serves commands and questions. It uses rustls for TLS 1.3 and has no
   threads of its own. The app calls it in a loop.
-- **A voice turn.** The recording goes to Muse as a WAV voice note. Muse
-  answers in text. The app sends that text to OpenAI and plays the audio
+- **A voice turn.** The recording is cut to a third of its size, brought to
+  an even loudness, and sent to Muse as a WAV voice note. Muse answers in
+  text. The app sends that text to OpenAI and plays the audio
   while it is still arriving.
 - **Four threads share one processor.** They are the screen, the microphone,
   the connection and the speech. They pass work to each other through
@@ -214,8 +215,8 @@ every line. Read that first when something misbehaves on the PSP.
 - **No voice without OpenAI.** There is no offline voice and no text on
   screen, so an answer that cannot be spoken is only signalled.
 - **Uploads are slow and sometimes stall.** A two second question takes
-  about ten seconds to reach Muse on my PSP, and now and then one fails and
-  has to be asked again.
+  several seconds to reach Muse on my PSP. One that is lost on the way is
+  asked again once without you doing anything, which takes longer still.
 - **Long answers are spoken only in part.** About the first 420 characters.
 - **Muse sends text, not audio.** The voice is always made separately.
 

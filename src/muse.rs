@@ -111,7 +111,24 @@ impl Clock for Psp {
 struct Avatar {
     /// Whether this question's reply has been sent to be spoken.
     spoken: bool,
+    /// The recording, until Muse says it heard it. A PSP's upload stalls
+    /// often enough that one lost on the way is asked again without the
+    /// user having to.
+    unheard: Option<Vec<u8>>,
+    again: Again,
 }
+
+#[derive(Default, PartialEq)]
+enum Again {
+    #[default]
+    Allowed,
+    /// To be asked when Muse is next reachable, unless that takes too long.
+    Wanted { since_ms: u32 },
+    Used,
+}
+
+/// How long a question waits for Muse to come back before it is dropped.
+const AGAIN_WITHIN_MS: u32 = 60_000;
 
 impl Avatar {
     fn speak(&mut self, text: &str) {
@@ -137,7 +154,10 @@ impl App for Avatar {
                 }
             }
             Event::Log(line) => crate::say!("muse: {}", line),
-            Event::Heard(text) => crate::say!("heard: {}", text),
+            Event::Heard(text) => {
+                crate::say!("heard: {}", text);
+                self.unheard = None;
+            }
             Event::Reply(_) => {}
             // The stream has paused, which is almost always the whole reply,
             // a couple of seconds before `Done` confirms it.
@@ -149,12 +169,19 @@ impl App for Avatar {
                 crate::say!("reply: {}", text);
                 self.speak(text);
                 self.spoken = false;
+                self.unheard = None;
                 TURN.store(ANSWERED, Ordering::Relaxed);
             }
             Event::Failed { why, .. } => {
-                crate::say!("question failed: {}", why);
                 self.spoken = false;
-                TURN.store(NO_QUESTION, Ordering::Relaxed);
+                if self.unheard.is_some() && self.again == Again::Allowed {
+                    crate::say!("question failed: {}, asking again", why);
+                    self.again = Again::Wanted { since_ms: crate::report::now_ms() };
+                } else {
+                    crate::say!("question failed: {}", why);
+                    self.unheard = None;
+                    TURN.store(NO_QUESTION, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -219,10 +246,30 @@ fn serve() -> Result<(), String> {
             },
             Poll::Unpaired => return Err("Muse no longer knows this PSP. It has to be paired again.".into()),
         }
-        if let Some(wav) = taken() {
+        let fresh = taken();
+        if let Some(wav) = &fresh {
             entropy::stir(&wav[wav.len() / 2..]);
+            app.again = Again::Allowed;
+        }
+        let again = match app.again {
+            Again::Wanted { since_ms } if crate::report::now_ms().wrapping_sub(since_ms) > AGAIN_WITHIN_MS => {
+                crate::say!("question dropped: Muse did not come back in time");
+                app.again = Again::Used;
+                app.unheard = None;
+                TURN.store(NO_QUESTION, Ordering::Relaxed);
+                None
+            }
+            Again::Wanted { .. } if client.state() == State::Connected && !client.asking() => {
+                app.again = Again::Used;
+                app.unheard.take()
+            }
+            _ => None,
+        };
+        if let Some(wav) = fresh.or(again) {
+            app.unheard = Some(wav.clone());
             if let Err(refused) = client.ask_voice(wav) {
                 crate::say!("question refused: {:?}", refused);
+                app.unheard = None;
                 TURN.store(NO_QUESTION, Ordering::Relaxed);
             }
         }

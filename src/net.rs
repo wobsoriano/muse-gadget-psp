@@ -24,6 +24,9 @@ const WIFI_DISCONNECTED: i32 = 0;
 const WIFI_GOT_ADDRESS: i32 = 4;
 
 const PATIENCE_MS: i32 = 15_000;
+/// A send that takes nothing for this long has not been seen to recover,
+/// and the question it carried can be asked again sooner.
+const STALLED_MS: i32 = 8_000;
 const LOOKUP_WAIT_MS: i32 = 1_500;
 /// The most handed to the socket in one call, each sent at once. A real PSP
 /// stalled for whole seconds on large uploads until they went out this way.
@@ -180,10 +183,10 @@ impl Stream for Socket {
         // found. That is a wait, and only silence past the limit is a loss.
         let mut progressed = unsafe { sys::sceKernelGetSystemTimeLow() };
         while !bytes.is_empty() {
-            if !ready(self.0, POLLOUT, PATIENCE_MS) {
+            if !ready(self.0, POLLOUT, STALLED_MS) {
                 let mut poll = SceNetInetPollfd { fd: self.0, events: POLLOUT | POLLIN, revents: 0 };
                 let result = unsafe { sys::sceNetInetPoll(&mut poll, 1, 0) };
-                crate::say!("net: no room to write for {} s, {} bytes left, poll {} events {:#x}", PATIENCE_MS / 1000, bytes.len(), result, poll.revents);
+                crate::say!("net: no room to write for {} s, {} bytes left, poll {} events {:#x}", STALLED_MS / 1000, bytes.len(), result, poll.revents);
                 return Err(Lost);
             }
             let piece = bytes.len().min(SEND_AT_MOST);
@@ -197,7 +200,7 @@ impl Stream for Socket {
                 _ => {
                     let stalled_ms = now.wrapping_sub(progressed) / 1000;
                     let failure = if sent == 0 { None } else { would_block() };
-                    if let Some(errno) = failure.or((stalled_ms > PATIENCE_MS as u32).then_some(0)) {
+                    if let Some(errno) = failure.or((stalled_ms > STALLED_MS as u32).then_some(0)) {
                         crate::say!("net: write failed, result {} errno {}, {} bytes left", sent, errno, bytes.len());
                         return Err(Lost);
                     }

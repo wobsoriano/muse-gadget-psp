@@ -36,7 +36,9 @@ const LONGEST_TURN_MS: u64 = 900_000;
 const SETTLED_AFTER_MS: u64 = 350;
 const DONE_AFTER_MS: u64 = 3_000;
 const PING_EVERY_MS: u64 = 15_000;
-const PONG_PATIENCE_MS: u64 = 10_000;
+// A real PSP's uplink has stalled for whole seconds at a time and then
+// recovered, so a session is not given up on quickly.
+const PONG_PATIENCE_MS: u64 = 30_000;
 
 macro_rules! log {
     ($app:expr, $($format:tt)*) => {

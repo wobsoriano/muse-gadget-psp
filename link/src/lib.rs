@@ -11,6 +11,7 @@ pub mod dns;
 pub mod https;
 pub mod secure;
 pub mod speech;
+pub mod wav;
 
 mod api;
 mod channel;
