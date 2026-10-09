@@ -2,8 +2,9 @@
 
     uv run --with pytest --with cryptography --with websockets pytest tests/test_rust_session.py -v
 
-The first three tests cover what muse-psp/tests/test_c_session.py covers. The
-rest cover what the Rust client does that the C client does not.
+The first three tests cover a session, a voice note and a dead connection.
+The rest cover the edges: commands on the chat stream, a refused door, lost
+tokens, and what the app is told when Muse cannot be reached.
 """
 
 import hashlib
@@ -232,7 +233,7 @@ def test_a_door_that_says_403_is_asked_again_quickly(driver, tmp_path):
     knocks = transcript["knocks"]
     assert len(knocks) == 4 and transcript["connections"] == 1
     gaps = [later - earlier for earlier, later in zip(knocks, knocks[1:])]
-    # The API said every 150 ms. The C client would have waited 15 seconds.
+    # The API said every 150 ms.
     assert all(0.14 <= gap < 1.0 for gap in gaps), gaps
     check_api(transcript)       # one VM fetch: the same bearer is offered each time
     assert [e for e in named(events) if e[0] == "state"] == [
@@ -244,7 +245,7 @@ def test_a_door_that_stays_shut_is_unreachable(driver, tmp_path):
     events, _ = run_session(driver, tmp_path, ["--forbid", "1000"], ["--until-unreachable"])
 
     logs = [e[1] for e in events if e[0] == "log"]
-    # Five more tries as the API allowed, then the long wait the C client always took.
+    # Five more tries as the API allowed, then the long wait.
     assert logs.count("connecting to test") == 6
     assert "trying again in 15 s" in logs
     assert [e for e in named(events) if e[0] == "state"] == [

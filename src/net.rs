@@ -1,9 +1,9 @@
 //! Wi-Fi, name lookup and TCP on the PSP.
 //!
 //! Sockets stay non-blocking and every wait goes through `sceNetInetPoll`
-//! with a limit, and names are looked up here over UDP. Both come from the C
-//! app: on a real PSP the system resolver sometimes never returned, and a
-//! blocking socket has no limit to give up at.
+//! with a limit, and names are looked up here over UDP. On a real PSP the
+//! system resolver sometimes never returned, and a blocking socket has no
+//! limit to give up at.
 
 use crate::entropy;
 use alloc::{format, string::String, vec::Vec};
@@ -179,8 +179,8 @@ impl Stream for Socket {
     }
 
     fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), Lost> {
-        // A PSP socket can report room and then take nothing, as the C app
-        // found. That is a wait, and only silence past the limit is a loss.
+        // A PSP socket can report room and then take nothing. That is a wait,
+        // and only silence past the limit is a loss.
         let mut progressed = unsafe { sys::sceKernelGetSystemTimeLow() };
         while !bytes.is_empty() {
             if !ready(self.0, POLLOUT, STALLED_MS) {

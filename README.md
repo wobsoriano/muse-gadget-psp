@@ -16,10 +16,6 @@ written in Rust, and the Muse client follows the protocol of the
 > Sony Interactive Entertainment. Muse is a product of Meta. You use this at
 > your own risk, including the custom firmware it needs.
 
-The first version of this app was written in C. It is kept on the
-[`c-version`](../../tree/c-version) branch. It has a voice picker, a built-in
-offline voice and on-screen text, which this version does not.
-
 ## What you need
 
 - **A PSP-3000.** I built and tested it on one PSP-3001. It needs the
@@ -37,7 +33,7 @@ offline voice and on-screen text, which this version does not.
   SDK's Linux client will do. See [Pair it with Muse](#4-pair-it-with-muse)
   for why.
 - **An OpenAI API key, for the voice.** Without one the PSP still hears you
-  and Muse still answers, but the answer is not spoken.
+  and Muse still answers, but the PSP stays silent.
 
 ## Install
 
@@ -74,8 +70,9 @@ the clone and the output.
 cargo psp --release
 ```
 
-This produces `target/mipsel-sony-psp/release/EBOOT.PBP`. The warnings it
-prints come from the PSP library in `vendor/psp` and can be ignored.
+This produces `target/mipsel-sony-psp/release/EBOOT.PBP`. It also prints a
+wall of warnings. They come from the PSP library in `vendor/psp`, and you can
+ignore them.
 
 ### 4. Pair it with Muse
 
@@ -132,8 +129,8 @@ sure the date and time are set, and run **Muse** from the Game menu.
 
 Hold **R** to talk and release to send. Press **HOME** to quit.
 
-The corner of the screen shows whether Muse can be reached, and the avatar
-shows what is happening.
+The corner of the screen shows whether the PSP can reach Muse, and the avatar
+shows what it is doing.
 
 | You see | It means |
 |---|---|
@@ -143,7 +140,7 @@ shows what is happening.
 | The avatar in blue | Listening while you hold R |
 | The avatar in pink, with thought dots | Your question is on its way, or Muse is answering |
 | The avatar in green, with sound waves | Speaking the answer |
-| Hearts for a few seconds, no sound | Muse answered and the answer could not be spoken |
+| Hearts for a few seconds, no sound | Muse answered and the PSP could not speak it |
 
 **What Muse can do to the PSP.** Ask Muse from any device:
 
@@ -170,18 +167,18 @@ vendor/   the PSP library, with two small additions
   a WebSocket, runs a Noise XX handshake inside it, registers the PSP, and
   then serves commands and questions. It uses rustls for TLS 1.3 and has no
   threads of its own. The app calls it in a loop.
-- **A voice turn.** The recording is cut to a third of its size, brought to
-  an even loudness, and sent to Muse as a WAV voice note. Muse answers in
-  text. The app sends that text to OpenAI and plays the audio
-  while it is still arriving.
-- **Four threads share one processor.** They are the screen, the microphone,
-  the connection and the speech. They pass work to each other through
-  atomics, because a lock between threads of different priority can hang a
-  PSP.
+- **A voice turn.** The app cuts the recording to a third of its size, evens
+  out its loudness, and sends it to Muse as a WAV voice note. Muse answers in
+  text. The app sends that text to OpenAI and plays the audio while it is
+  still arriving.
+- **Five threads share one processor.** They are the screen, the microphone,
+  the connection, the speech download and the speaker. They pass work to
+  each other through atomics, because a lock between threads of different
+  priority can hang a PSP.
 - **Things the PSP made hard.** It has no hardware random source, so room
   noise from the microphone feeds the encryption. Its own name lookup could
   hang forever, so the app does its own DNS. Its working folder belongs to
-  one thread, so every file is opened by its full path.
+  one thread, so the app opens every file by its full path.
 
 ## Develop
 
@@ -213,12 +210,13 @@ every line. Read that first when something misbehaves on the PSP.
 - **The random numbers are weaker than a modern device's.** Microphone noise
   is the best source the PSP offers.
 - **No voice without OpenAI.** There is no offline voice and no text on
-  screen, so an answer that cannot be spoken is only signalled.
+  screen. When the PSP cannot speak an answer, all you get is the hearts.
 - **Uploads are slow and sometimes stall.** A two second question takes
-  several seconds to reach Muse on my PSP. One that is lost on the way is
-  asked again once without you doing anything, which takes longer still.
-- **Long answers are spoken only in part.** About the first 420 characters.
-- **Muse sends text, not audio.** The voice is always made separately.
+  several seconds to reach Muse on my PSP. If one gets lost on the way,
+  the app asks it again once by itself, which takes longer still.
+- **Long answers get cut short.** The PSP speaks about the first 420
+  characters.
+- **Muse sends text, not audio.** OpenAI makes the voice.
 
 ## License
 
