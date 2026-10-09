@@ -48,6 +48,9 @@ fn psp_main() {
     };
     // The network modules load before the connection threads' stacks exist.
     // Loaded after, the second one failed for lack of room.
+    if pressed().contains(CtrlButtons::LTRIGGER) {
+        muse::WIFI_PROFILE.store(2, Ordering::Relaxed);
+    }
     match net::start() {
         Ok(()) => {
             muse::start();

@@ -14,8 +14,10 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, Ordering};
 use muse_link::{secure, App, Client, Clock, Config, Event, Lost, Net, Poll, Security, State};
 use psp::sys::{self, ThreadAttributes};
 
-/// The first saved connection in the PSP's Network Settings.
-const WIFI_PROFILE: i32 = 1;
+/// Which saved connection in the PSP's Network Settings to join. The first,
+/// unless L was held as the app started, which picks the second. That is
+/// for trying another network without editing the first.
+pub static WIFI_PROFILE: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(1);
 /// Below the screen loop's 32, where a larger number yields. The PSP does not
 /// share time between equals, so at 32 a handshake would freeze the avatar.
 const PRIORITY: i32 = 40;
@@ -174,6 +176,9 @@ impl App for Avatar {
             }
             Event::Failed { why, .. } => {
                 self.spoken = false;
+                if let Some((_, signal)) = net::wifi() {
+                    crate::say!("signal {} of 100 when the question failed", signal);
+                }
                 if self.unheard.is_some() && self.again == Again::Allowed {
                     crate::say!("question failed: {}, asking again", why);
                     self.again = Again::Wanted { since_ms: crate::report::now_ms() };
@@ -223,12 +228,16 @@ impl App for Avatar {
 }
 
 fn serve() -> Result<(), String> {
-    while let Err(why) = net::join(WIFI_PROFILE) {
+    let profile = WIFI_PROFILE.load(Ordering::Relaxed);
+    while let Err(why) = net::join(profile) {
         crate::say!("{}, trying again in 5 s", why);
         trouble();
         unsafe { sys::sceKernelDelayThread(5_000_000) };
     }
-    crate::say!("Wi-Fi joined");
+    match net::wifi() {
+        Some((name, signal)) => crate::say!("Wi-Fi joined: connection {}, {:?}, signal {} of 100", profile, name, signal),
+        None => crate::say!("Wi-Fi joined: connection {}", profile),
+    }
     let saved = store::load()?;
     let mut config = Config::new(&saved.node_id, "PSP", env!("CARGO_PKG_VERSION"), concat!("muse-gadget-psp/", env!("CARGO_PKG_VERSION")));
     config.commands_json = Some(COMMANDS.into());
