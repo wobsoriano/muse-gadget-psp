@@ -18,12 +18,9 @@ Muse Gadget SDK
 
 rust-psp
   https://github.com/overdrivenpotato/rust-psp
-  MIT License. The app builds on a fork of version 0.3.14 at
-  https://github.com/wobsoriano/rust-psp, branch muse-gadget-psp, which adds
-  two things. One is the sceNetInetPoll call and its SceNetInetPollfd type,
-  which the upstream crate does not declare. The other is STARTED_FROM, the
-  path the program was started from. Cargo fetches the fork. One file from
-  rust-psp is included here, its debug font, as src/msxfont.bin.
+  MIT License. Cargo fetches the psp crate, version 0.3.14. Two pieces of
+  rust-psp are included here. src/msxfont.bin is its debug font, and
+  src/startup.rs is its module! macro written out with one line added.
 
 Root certificates
   link/certs

@@ -1,15 +1,17 @@
 //! Wi-Fi, name lookup and TCP on the PSP.
 //!
-//! Sockets stay non-blocking and every wait goes through `sceNetInetPoll`
-//! with a limit, and names are looked up here over UDP. On a real PSP the
-//! system resolver sometimes never returned, and a blocking socket has no
-//! limit to give up at.
+//! Sockets never block. A call that finds nothing to do says so at once,
+//! and the wait is a short sleep and another try, up to a limit. The system
+//! has a call that waits on a socket with a limit, but the PSP library does
+//! not declare it, and a blocking socket has no limit to give up at. Names
+//! are looked up here over UDP, because on a real PSP the system resolver
+//! sometimes never returned.
 
 use crate::entropy;
 use alloc::{format, string::String, vec::Vec};
 use core::ffi::c_void;
 use muse_link::{dns, Lost, Stream, Wire};
-use psp::sys::{self, sockaddr, ApctlInfo, NetModule, SceNetApctlInfo, SceNetInetPollfd};
+use psp::sys::{self, sockaddr, ApctlInfo, NetModule, SceNetApctlInfo};
 
 const AF_INET: u8 = 2;
 const SOCK_STREAM: i32 = 1;
@@ -17,17 +19,17 @@ const SOCK_DGRAM: i32 = 2;
 const SOL_SOCKET: i32 = 0xffff;
 const SO_NONBLOCK: i32 = 0x1009;
 const SO_ERROR: i32 = 0x1007;
-const POLLIN: i16 = 0x0001;
-const POLLOUT: i16 = 0x0004;
 
 const WIFI_DISCONNECTED: i32 = 0;
 const WIFI_GOT_ADDRESS: i32 = 4;
 
-const PATIENCE_MS: i32 = 15_000;
+const PATIENCE_MS: u32 = 15_000;
 /// A send that takes nothing for this long has not been seen to recover,
 /// and the question it carried can be asked again sooner.
-const STALLED_MS: i32 = 8_000;
-const LOOKUP_WAIT_MS: i32 = 1_500;
+const STALLED_MS: u32 = 8_000;
+const LOOKUP_WAIT_MS: u32 = 1_500;
+/// How long a socket with nothing to do is left alone before the next try.
+const TRY_EVERY_MICROS: u32 = 5_000;
 /// The most handed to the socket in one call, each sent at once. A real PSP
 /// stalled for whole seconds on large uploads until they went out this way.
 const SEND_AT_MOST: usize = 512;
@@ -104,18 +106,64 @@ fn peer(address: [u8; 4], port: u16) -> sockaddr {
     peer
 }
 
-fn ready(fd: i32, events: i16, wait_ms: i32) -> bool {
-    let mut poll = SceNetInetPollfd { fd, events, revents: 0 };
-    unsafe { sys::sceNetInetPoll(&mut poll, 1, wait_ms) > 0 }
+/// What one try at moving bytes through a socket came to.
+enum Tried {
+    Moved(usize),
+    /// Nothing to read, or no room to write, at this instant.
+    Nothing,
+    /// The other side has closed. Only a read can find this out.
+    Closed,
+    Failed(i32),
 }
 
-pub struct Socket(i32);
+impl Tried {
+    fn of(result: isize, most: usize, reading: bool) -> Tried {
+        // The PSP's own numbers for "try again" and "interrupted", and the
+        // BSD number for the first in case a firmware reports that one.
+        const NOT_NOW: [i32; 3] = [11, 4, 35];
+        match usize::try_from(result) {
+            Ok(0) if reading => Tried::Closed,
+            Ok(0) => Tried::Nothing,
+            Ok(count) if count <= most => Tried::Moved(count),
+            _ => match unsafe { sys::sceNetInetGetErrno() } {
+                errno if NOT_NOW.contains(&errno) => Tried::Nothing,
+                errno => Tried::Failed(errno),
+            },
+        }
+    }
+}
+
+fn micros() -> u32 {
+    unsafe { sys::sceKernelGetSystemTimeLow() }
+}
+
+/// Runs `attempt` until it has an answer, sleeping between tries, and gives
+/// up with `None` after `limit_ms`.
+fn until<T>(limit_ms: u32, mut attempt: impl FnMut() -> Option<T>) -> Option<T> {
+    let started = micros();
+    loop {
+        if let Some(answer) = attempt() {
+            return Some(answer);
+        }
+        if micros().wrapping_sub(started) / 1000 >= limit_ms {
+            return None;
+        }
+        unsafe { sys::sceKernelDelayThread(TRY_EVERY_MICROS) };
+    }
+}
+
+pub struct Socket {
+    fd: i32,
+    /// A byte `readable` had to take to learn there was one.
+    taken: Option<u8>,
+    closed: bool,
+}
 
 impl Socket {
     fn new(kind: i32) -> Result<Socket, String> {
         let fd = unsafe { sys::sceNetInetSocket(AF_INET as i32, kind, 0) };
         step("socket", fd)?;
-        let socket = Socket(fd);
+        let socket = Socket { fd, taken: None, closed: false };
         let on = 1i32;
         step("non-blocking", unsafe {
             sys::sceNetInetSetsockopt(fd, SOL_SOCKET, SO_NONBLOCK, &on as *const i32 as *const c_void, 4)
@@ -127,84 +175,93 @@ impl Socket {
         let socket = Socket::new(SOCK_STREAM)?;
         let on = 1i32;
         let ungathered =
-            unsafe { sys::sceNetInetSetsockopt(socket.0, IPPROTO_TCP, TCP_NODELAY, &on as *const i32 as *const c_void, 4) };
+            unsafe { sys::sceNetInetSetsockopt(socket.fd, IPPROTO_TCP, TCP_NODELAY, &on as *const i32 as *const c_void, 4) };
         if ungathered < 0 {
             crate::say!("net: could not turn off send gathering: {:#x}", ungathered);
         }
         let peer = peer(address, port);
-        if unsafe { sys::sceNetInetConnect(socket.0, &peer, 16) } < 0 {
-            let errno = unsafe { sys::sceNetInetGetErrno() };
-            if !ready(socket.0, POLLOUT, PATIENCE_MS) {
-                return Err(format!("the server did not answer (errno {})", errno));
-            }
+        if unsafe { sys::sceNetInetConnect(socket.fd, &peer, 16) } >= 0 {
+            return Ok(socket);
+        }
+        // The connection is being made. It is there once the socket can
+        // name who it is connected to, and it has failed once the socket
+        // holds an error.
+        let made = until(PATIENCE_MS, || {
             let (mut failure, mut size) = (0i32, 4u32);
             let read = unsafe {
-                sys::sceNetInetGetsockopt(socket.0, SOL_SOCKET, SO_ERROR, &mut failure as *mut i32 as *mut c_void, &mut size)
+                sys::sceNetInetGetsockopt(socket.fd, SOL_SOCKET, SO_ERROR, &mut failure as *mut i32 as *mut c_void, &mut size)
             };
             if read < 0 || failure != 0 {
-                return Err(format!("the server refused the connection ({})", failure));
+                return Some(Err(format!("the server refused the connection ({})", failure)));
             }
-        }
-        Ok(socket)
+            let (mut who, mut who_size) = (peer, 16u32);
+            (unsafe { sys::sceNetInetGetpeername(socket.fd, &mut who, &mut who_size) } >= 0).then_some(Ok(()))
+        });
+        made.unwrap_or_else(|| Err("the server did not answer".into())).map(|()| socket)
     }
-}
 
-/// The socket has no room, or nothing to give, at this instant. Not a failure.
-fn would_block() -> Option<i32> {
-    const EINTR: i32 = 4;
-    const EAGAIN: i32 = 11;
-    let errno = unsafe { sys::sceNetInetGetErrno() };
-    (errno != EAGAIN && errno != EINTR).then_some(errno)
+    fn receive(&mut self, into: &mut [u8]) -> Tried {
+        let got = unsafe { sys::sceNetInetRecv(self.fd, into.as_mut_ptr() as *mut c_void, into.len(), 0) };
+        let tried = Tried::of(got, into.len(), true);
+        match tried {
+            Tried::Moved(_) => entropy::stir(&micros().to_le_bytes()),
+            Tried::Closed => self.closed = true,
+            Tried::Nothing | Tried::Failed(_) => {}
+        }
+        tried
+    }
 }
 
 impl Stream for Socket {
     fn read(&mut self, into: &mut [u8]) -> Result<usize, Lost> {
-        let started = unsafe { sys::sceKernelGetSystemTimeLow() };
-        loop {
-            if !ready(self.0, POLLIN, PATIENCE_MS) {
-                crate::say!("net: nothing to read for {} s", PATIENCE_MS / 1000);
-                return Err(Lost);
-            }
-            let got = unsafe { sys::sceNetInetRecv(self.0, into.as_mut_ptr() as *mut c_void, into.len(), 0) };
-            entropy::stir(&got.to_le_bytes());
-            if let Some(count) = usize::try_from(got).ok().filter(|&count| count <= into.len()) {
-                return Ok(count);
-            }
-            let waited_ms = unsafe { sys::sceKernelGetSystemTimeLow() }.wrapping_sub(started) / 1000;
-            if let Some(errno) = would_block().or((waited_ms > PATIENCE_MS as u32).then_some(0)) {
-                crate::say!("net: read failed, result {} errno {}", got, errno);
-                return Err(Lost);
-            }
+        if into.is_empty() {
+            return Ok(0);
         }
+        if let Some(byte) = self.taken.take() {
+            into[0] = byte;
+            return Ok(match self.receive(&mut into[1..]) {
+                Tried::Moved(more) => 1 + more,
+                _ => 1,
+            });
+        }
+        if self.closed {
+            return Ok(0);
+        }
+        let read = until(PATIENCE_MS, || match self.receive(into) {
+            Tried::Moved(count) => Some(Ok(count)),
+            Tried::Closed => Some(Ok(0)),
+            Tried::Nothing => None,
+            Tried::Failed(errno) => {
+                crate::say!("net: read failed, errno {}", errno);
+                Some(Err(Lost))
+            }
+        });
+        read.unwrap_or_else(|| {
+            crate::say!("net: nothing to read for {} s", PATIENCE_MS / 1000);
+            Err(Lost)
+        })
     }
 
     fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), Lost> {
-        // A PSP socket can report room and then take nothing. That is a wait,
-        // and only silence past the limit is a loss.
-        let mut progressed = unsafe { sys::sceKernelGetSystemTimeLow() };
         while !bytes.is_empty() {
-            if !ready(self.0, POLLOUT, STALLED_MS) {
-                let mut poll = SceNetInetPollfd { fd: self.0, events: POLLOUT | POLLIN, revents: 0 };
-                let result = unsafe { sys::sceNetInetPoll(&mut poll, 1, 0) };
-                crate::say!("net: no room to write for {} s, {} bytes left, poll {} events {:#x}", STALLED_MS / 1000, bytes.len(), result, poll.revents);
-                return Err(Lost);
-            }
             let piece = bytes.len().min(SEND_AT_MOST);
-            let sent = unsafe { sys::sceNetInetSend(self.0, bytes.as_ptr() as *const c_void, piece, 0) };
-            let now = unsafe { sys::sceKernelGetSystemTimeLow() };
-            match usize::try_from(sent) {
-                Ok(count) if count > 0 && count <= piece => {
-                    bytes = &bytes[count..];
-                    progressed = now;
+            let sent = until(STALLED_MS, || {
+                let sent = unsafe { sys::sceNetInetSend(self.fd, bytes.as_ptr() as *const c_void, piece, 0) };
+                match Tried::of(sent, piece, false) {
+                    Tried::Moved(count) => Some(Ok(count)),
+                    Tried::Nothing | Tried::Closed => None,
+                    Tried::Failed(errno) => Some(Err(errno)),
                 }
-                _ => {
-                    let stalled_ms = now.wrapping_sub(progressed) / 1000;
-                    let failure = if sent == 0 { None } else { would_block() };
-                    if let Some(errno) = failure.or((stalled_ms > STALLED_MS as u32).then_some(0)) {
-                        crate::say!("net: write failed, result {} errno {}, {} bytes left", sent, errno, bytes.len());
-                        return Err(Lost);
-                    }
-                    unsafe { sys::sceKernelDelayThread(5_000) };
+            });
+            match sent {
+                Some(Ok(count)) => bytes = &bytes[count..],
+                Some(Err(errno)) => {
+                    crate::say!("net: write failed, errno {}, {} bytes left", errno, bytes.len());
+                    return Err(Lost);
+                }
+                None => {
+                    crate::say!("net: no room to write for {} s, {} bytes left", STALLED_MS / 1000, bytes.len());
+                    return Err(Lost);
                 }
             }
         }
@@ -214,18 +271,31 @@ impl Stream for Socket {
 
 impl Wire for Socket {
     fn readable(&mut self, wait_ms: u32) -> Result<bool, Lost> {
-        let mut poll = SceNetInetPollfd { fd: self.0, events: POLLIN, revents: 0 };
-        match unsafe { sys::sceNetInetPoll(&mut poll, 1, wait_ms as i32) } {
-            waiting if waiting < 0 => Err(Lost),
-            // A hang-up counts as readable, so the read that follows sees it.
-            waiting => Ok(waiting > 0),
+        // A hang-up counts as readable, so the read that follows sees it.
+        if self.taken.is_some() || self.closed {
+            return Ok(true);
+        }
+        let mut byte = [0u8; 1];
+        let found = until(wait_ms, || match self.receive(&mut byte) {
+            Tried::Moved(_) => Some(Ok(Some(byte[0]))),
+            Tried::Closed => Some(Ok(None)),
+            Tried::Nothing => None,
+            Tried::Failed(_) => Some(Err(Lost)),
+        });
+        match found {
+            Some(Ok(taken)) => {
+                self.taken = taken;
+                Ok(true)
+            }
+            Some(Err(lost)) => Err(lost),
+            None => Ok(false),
         }
     }
 }
 
 impl Drop for Socket {
     fn drop(&mut self) {
-        unsafe { sys::sceNetInetClose(self.0) };
+        unsafe { sys::sceNetInetClose(self.fd) };
     }
 }
 
@@ -236,15 +306,22 @@ fn ask(socket: &Socket, server: [u8; 4], host: &str) -> Option<[u8; 4]> {
     let mut packet = [0u8; 512];
     let length = dns::query(&mut packet, host, id)?;
     let to = peer(server, 53);
-    let sent = unsafe { sys::sceNetInetSendto(socket.0, packet.as_ptr() as *const c_void, length, 0, &to, 16) };
-    if sent != length as isize || !ready(socket.0, POLLIN, LOOKUP_WAIT_MS) {
+    let sent = unsafe { sys::sceNetInetSendto(socket.fd, packet.as_ptr() as *const c_void, length, 0, &to, 16) };
+    if sent != length as isize {
         return None;
     }
-    let (mut from, mut from_size) = (to, 16u32);
-    let got = unsafe {
-        sys::sceNetInetRecvfrom(socket.0, packet.as_mut_ptr() as *mut c_void, packet.len(), 0, &mut from, &mut from_size)
-    };
-    let reply = packet.get(..usize::try_from(got).ok()?)?;
+    let got = until(LOOKUP_WAIT_MS, || {
+        let (mut from, mut from_size) = (to, 16u32);
+        let got = unsafe {
+            sys::sceNetInetRecvfrom(socket.fd, packet.as_mut_ptr() as *mut c_void, packet.len(), 0, &mut from, &mut from_size)
+        };
+        match Tried::of(got, packet.len(), true) {
+            Tried::Moved(count) => Some(Some(count)),
+            Tried::Nothing => None,
+            Tried::Closed | Tried::Failed(_) => Some(None),
+        }
+    })??;
+    let reply = &packet[..got];
     entropy::stir(reply);
     dns::answer(reply, id)
 }

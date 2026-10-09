@@ -4,9 +4,7 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-# rust-psp 0.3.14 with two additions the app needs: sceNetInetPoll and
-# STARTED_FROM. Pinned to one commit so it cannot change underneath.
-psp = { git = "https://github.com/wobsoriano/rust-psp", rev = "79d04f14faff953c5a00c784f4e490150bf11d46" }
+psp = "0.3.14"
 muse-link = { path = "link" }
 rustls = { version = "0.23.45", default-features = false }
 getrandom = { version = "0.2", features = ["custom"] }

@@ -6,7 +6,7 @@ use psp::sys::{self, IoOpenFlags};
 
 /// The folder the app was started from, with its closing slash.
 pub fn home() -> &'static [u8] {
-    let started_from = psp::STARTED_FROM.load(core::sync::atomic::Ordering::Relaxed);
+    let started_from = crate::startup::STARTED_FROM.load(core::sync::atomic::Ordering::Relaxed);
     if started_from.is_null() {
         return b"";
     }

@@ -12,6 +12,7 @@ mod muse;
 mod net;
 mod report;
 mod screen;
+mod startup;
 mod status;
 mod store;
 mod voice;
@@ -22,8 +23,6 @@ use psp::sys::{self, CtrlButtons, SceCtrlData};
 use report::Timer;
 use screen::Screen;
 use status::Link;
-
-psp::module!("muse", 0, 2);
 
 /// How long Muse can be out of reach before the screen says so. A Muse that
 /// has been idle can take a while to wake, and the app keeps trying.
