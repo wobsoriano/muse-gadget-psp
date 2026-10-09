@@ -3,9 +3,9 @@
 
 use crate::screen::Screen;
 
-/// The font the Rust PSP library ships: 256 characters, eight rows of eight
-/// pixels each, the left pixel in the high bit.
-const FONT: &[u8; 2048] = include_bytes!("../vendor/psp/src/msxfont.bin");
+/// rust-psp's debug font: 256 characters, eight rows of eight pixels each,
+/// the left pixel in the high bit.
+const FONT: &[u8; 2048] = include_bytes!("msxfont.bin");
 
 const LEFT: usize = 10;
 const TOP: usize = 10;

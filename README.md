@@ -70,9 +70,7 @@ the clone and the output.
 cargo psp --release
 ```
 
-This produces `target/mipsel-sony-psp/release/EBOOT.PBP`. It also prints a
-wall of warnings. They come from the PSP library in `vendor/psp`, and you can
-ignore them.
+This produces `target/mipsel-sony-psp/release/EBOOT.PBP`.
 
 ### 4. Pair it with Muse
 
@@ -160,7 +158,6 @@ link/     the Muse client and the speech request, with no PSP code in them
 host/     programs that run link/ on a computer
 tools/    the avatar, pairing, installing
 tests/    the client against a fake Muse
-vendor/   the PSP library, with two small additions
 ```
 
 - **The Muse client** (`link/`) fetches your Muse's address over HTTPS, opens

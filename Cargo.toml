@@ -4,17 +4,15 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-psp = "0.3.14"
+# rust-psp 0.3.14 with two additions the app needs: sceNetInetPoll and
+# STARTED_FROM. Pinned to one commit so it cannot change underneath.
+psp = { git = "https://github.com/wobsoriano/rust-psp", rev = "79d04f14faff953c5a00c784f4e490150bf11d46" }
 muse-link = { path = "link" }
 rustls = { version = "0.23.45", default-features = false }
 getrandom = { version = "0.2", features = ["custom"] }
 sha2 = { version = "0.10", default-features = false }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
-
-# psp 0.3.14 plus sceNetInetPoll, which upstream does not declare.
-[patch.crates-io]
-psp = { path = "vendor/psp" }
 
 [profile.release]
 opt-level = "s"
