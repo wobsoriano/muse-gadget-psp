@@ -36,6 +36,11 @@ const SEND_AT_MOST: usize = 512;
 const FALLBACK_NAME_SERVERS: [[u8; 4]; 2] = [[1, 1, 1, 1], [8, 8, 8, 8]];
 const IPPROTO_TCP: i32 = 6;
 const TCP_NODELAY: i32 = 1;
+const TCP_MAXSEG: i32 = 2;
+/// The most data in one packet. Full-size packets from a real PSP were lost
+/// on the way out while small ones arrived, which stalled every large
+/// upload. Any network carries packets this small.
+const SEGMENT: i32 = 536;
 
 fn step(name: &str, result: i32) -> Result<(), String> {
     if result < 0 {
@@ -181,6 +186,7 @@ impl Socket {
         }
         let peer = peer(address, port);
         if unsafe { sys::sceNetInetConnect(socket.fd, &peer, 16) } >= 0 {
+            socket.send_small_packets();
             return Ok(socket);
         }
         // The connection is being made. It is there once the socket can
@@ -197,7 +203,26 @@ impl Socket {
             let (mut who, mut who_size) = (peer, 16u32);
             (unsafe { sys::sceNetInetGetpeername(socket.fd, &mut who, &mut who_size) } >= 0).then_some(Ok(()))
         });
-        made.unwrap_or_else(|| Err("the server did not answer".into())).map(|()| socket)
+        made.unwrap_or_else(|| Err("the server did not answer".into()))?;
+        socket.send_small_packets();
+        Ok(socket)
+    }
+
+    /// Asked once the connection exists, because the system only lets the
+    /// size be made smaller than the one the connection already has.
+    fn send_small_packets(&self) {
+        let set = unsafe {
+            sys::sceNetInetSetsockopt(self.fd, IPPROTO_TCP, TCP_MAXSEG, &SEGMENT as *const i32 as *const c_void, 4)
+        };
+        if set < 0 {
+            crate::say!("net: packets of {} refused, errno {}", SEGMENT, unsafe { sys::sceNetInetGetErrno() });
+        } else {
+            let (mut size, mut length) = (0i32, 4u32);
+            unsafe {
+                sys::sceNetInetGetsockopt(self.fd, IPPROTO_TCP, TCP_MAXSEG, &mut size as *mut i32 as *mut c_void, &mut length);
+            }
+            crate::say!("net: sending packets of at most {}", size);
+        }
     }
 
     fn receive(&mut self, into: &mut [u8]) -> Tried {
@@ -219,6 +244,10 @@ impl Stream for Socket {
         }
         if let Some(byte) = self.taken.take() {
             into[0] = byte;
+            // An empty read answers zero, which would pass for a hang-up.
+            if into.len() == 1 {
+                return Ok(1);
+            }
             return Ok(match self.receive(&mut into[1..]) {
                 Tried::Moved(more) => 1 + more,
                 _ => 1,

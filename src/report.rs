@@ -8,13 +8,18 @@ use crate::files;
 use psp::sys;
 
 const PATH: &str = "log.txt";
+const BEFORE: &str = "log-before.txt";
 
 /// Milliseconds since the PSP started.
 pub fn now_ms() -> u32 {
     (unsafe { sys::sceKernelGetSystemTimeWide() } / 1000) as u32
 }
 
+/// Starts a new log and keeps the last one. What went wrong is often in the
+/// run before the one that shows it.
 pub fn begin() {
+    files::remove(BEFORE);
+    files::rename(PATH, BEFORE);
     files::write(PATH, b"");
 }
 
