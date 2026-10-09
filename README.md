@@ -4,6 +4,8 @@ A native PSP app that turns a PlayStation Portable into a [Muse gadget](https://
 Hold R, talk into the built-in microphone, and Muse answers out loud through
 the speaker while its avatar listens, thinks and speaks on screen.
 
+![A silver PSP showing the Muse avatar, with a green light and the word online in the corner of the screen](docs/psp.jpg)
+
 Everything runs on the PSP. The app holds its own encrypted session with Muse
 over Wi-Fi, sends your voice as a voice note, and speaks the reply. It is
 written in Rust, and the Muse client follows the protocol of the
