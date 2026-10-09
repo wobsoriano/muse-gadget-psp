@@ -62,13 +62,24 @@ pub fn start() -> Result<(), String> {
 
 /// Joins the saved connection numbered `profile` in the PSP's Network Settings.
 pub fn join(profile: i32) -> Result<(), String> {
+    let joined = attempt_join(profile);
+    if joined.is_err() {
+        // The system refuses a new attempt while it still holds the last one.
+        unsafe { sys::sceNetApctlDisconnect() };
+    }
+    joined
+}
+
+fn attempt_join(profile: i32) -> Result<(), String> {
     step("wifi connect", unsafe { sys::sceNetApctlConnect(profile) })?;
     let mut last = -1;
-    // About 20 seconds to associate and get an address.
-    for tick in 0..400 {
+    // About 40 seconds to associate and get an address. A real PSP has
+    // taken 25.
+    for tick in 0..800 {
         let mut state = 0i32;
         step("wifi state", unsafe { sys::sceNetApctlGetState(&mut state as *mut i32 as *mut sys::ApctlState) })?;
         if state != last {
+            crate::say!("wifi state {}", state);
             entropy::stir(&state.to_le_bytes());
             last = state;
         }
