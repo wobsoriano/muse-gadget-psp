@@ -22,8 +22,20 @@ const PRIORITY: i32 = 40;
 
 pub const CONNECTING: u8 = 0;
 pub const CONNECTED: u8 = 1;
+/// The last try failed and another is coming.
 pub const TROUBLE: u8 = 2;
+/// Nothing more will be tried: there is no pairing, or Muse removed it.
+pub const DOWN: u8 = 3;
 pub static LINK: AtomicU8 = AtomicU8::new(CONNECTING);
+/// When the trouble began, on `report::now_ms`'s clock. One slow start is
+/// not worth alarming anyone over, so the screen waits before calling it.
+pub static TROUBLE_SINCE_MS: AtomicU32 = AtomicU32::new(0);
+
+fn trouble() {
+    if LINK.swap(TROUBLE, Ordering::Relaxed) != TROUBLE {
+        TROUBLE_SINCE_MS.store(crate::report::now_ms(), Ordering::Relaxed);
+    }
+}
 
 /// When the dance Muse asked for ends, on `report::now_ms`'s clock.
 pub static DANCE_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
@@ -114,12 +126,15 @@ impl App for Avatar {
         match event {
             Event::State(state) => {
                 crate::say!("muse: {:?}", state);
-                let link = match state {
-                    State::Connected => CONNECTED,
-                    State::Connecting => CONNECTING,
-                    State::Unreachable(_) | State::Unpaired => TROUBLE,
-                };
-                LINK.store(link, Ordering::Relaxed);
+                match state {
+                    State::Connected => LINK.store(CONNECTED, Ordering::Relaxed),
+                    // A drop is followed by a new try at once, which says
+                    // nothing yet about whether Muse can be reached.
+                    State::Connecting if LINK.load(Ordering::Relaxed) != TROUBLE => LINK.store(CONNECTING, Ordering::Relaxed),
+                    State::Connecting => {}
+                    State::Unreachable(_) => trouble(),
+                    State::Unpaired => LINK.store(DOWN, Ordering::Relaxed),
+                }
             }
             Event::Log(line) => crate::say!("muse: {}", line),
             Event::Heard(text) => crate::say!("heard: {}", text),
@@ -181,7 +196,11 @@ impl App for Avatar {
 }
 
 fn serve() -> Result<(), String> {
-    net::join(WIFI_PROFILE)?;
+    while let Err(why) = net::join(WIFI_PROFILE) {
+        crate::say!("{}, trying again in 5 s", why);
+        trouble();
+        unsafe { sys::sceKernelDelayThread(5_000_000) };
+    }
     crate::say!("Wi-Fi joined");
     let saved = store::load()?;
     let mut config = Config::new(&saved.node_id, "PSP", env!("CARGO_PKG_VERSION"), concat!("muse-gadget-psp/", env!("CARGO_PKG_VERSION")));
@@ -214,7 +233,7 @@ unsafe extern "C" fn run(_: usize, _: *mut c_void) -> i32 {
     if let Err(why) = serve() {
         crate::say!("FAIL: {}", why);
     }
-    LINK.store(TROUBLE, Ordering::Relaxed);
+    LINK.store(DOWN, Ordering::Relaxed);
     0
 }
 

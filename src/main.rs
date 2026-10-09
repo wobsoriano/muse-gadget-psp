@@ -25,6 +25,9 @@ use status::Link;
 
 psp::module!("muse", 0, 2);
 
+/// How long Muse can be out of reach before the screen says so. A Muse that
+/// has been idle can take a while to wake, and the app keeps trying.
+const PATIENCE_MS: u32 = 45_000;
 /// How long the avatar shows that an answer came when it cannot be spoken.
 const UNSPOKEN_MS: u32 = 3000;
 
@@ -38,7 +41,7 @@ fn psp_main() {
     psp::enable_home_button();
     unsafe { sys::scePowerSetClockFrequency(333, 333, 166) };
     report::begin();
-    say!("Muse {} for the PSP", env!("CARGO_PKG_VERSION"));
+    say!("Muse {} for the PSP, in {}", env!("CARGO_PKG_VERSION"), core::str::from_utf8(files::home()).unwrap_or("?"));
     entropy::seed();
     let Some(avatar) = files::read("avatar.bin").and_then(Avatar::parse) else {
         say!("FAIL: avatar.bin is missing or not one tools/avatar.sh wrote");
@@ -53,7 +56,7 @@ fn psp_main() {
         }
         Err(why) => {
             say!("FAIL: {}", why);
-            muse::LINK.store(muse::TROUBLE, Ordering::Relaxed);
+            muse::LINK.store(muse::DOWN, Ordering::Relaxed);
         }
     }
     audio::start();
@@ -65,9 +68,10 @@ fn psp_main() {
     loop {
         let now_ms = report::now_ms();
         let link = match muse::LINK.load(Ordering::Relaxed) {
-            muse::CONNECTING => Link::Connecting,
             muse::CONNECTED => Link::Online,
-            _ => Link::Offline,
+            muse::DOWN => Link::Offline,
+            muse::TROUBLE if now_ms.wrapping_sub(muse::TROUBLE_SINCE_MS.load(Ordering::Relaxed)) > PATIENCE_MS => Link::Offline,
+            _ => Link::Connecting,
         };
         let mut turn = muse::TURN.load(Ordering::Relaxed);
         let may_talk = link == Link::Online && turn == muse::NO_QUESTION;

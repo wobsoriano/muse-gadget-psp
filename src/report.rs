@@ -3,21 +3,11 @@
 //! still leaves everything up to it.
 
 use alloc::format;
-use core::ffi::c_void;
 use core::fmt;
-use psp::sys::{self, IoOpenFlags};
+use crate::files;
+use psp::sys;
 
-const PATH: &[u8] = b"log.txt\0";
-
-fn write(mode: IoOpenFlags, bytes: &[u8]) {
-    unsafe {
-        let file = sys::sceIoOpen(PATH.as_ptr(), IoOpenFlags::WR_ONLY | IoOpenFlags::CREAT | mode, 0o666);
-        if file.0 >= 0 {
-            sys::sceIoWrite(file, bytes.as_ptr() as *const c_void, bytes.len());
-            sys::sceIoClose(file);
-        }
-    }
-}
+const PATH: &str = "log.txt";
 
 /// Milliseconds since the PSP started.
 pub fn now_ms() -> u32 {
@@ -25,11 +15,11 @@ pub fn now_ms() -> u32 {
 }
 
 pub fn begin() {
-    write(IoOpenFlags::TRUNC, b"");
+    files::write(PATH, b"");
 }
 
 pub fn line(text: fmt::Arguments) {
-    write(IoOpenFlags::APPEND, format!("{:>7} {}\n", now_ms(), text).as_bytes());
+    files::append(PATH, format!("{:>7} {}\n", now_ms(), text).as_bytes());
 }
 
 #[macro_export]

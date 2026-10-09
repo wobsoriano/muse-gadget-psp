@@ -142,6 +142,14 @@ macro_rules! _start {
         unsafe { $crate::c_main($argc as _, $argv as _) as _ }
     };
 }
+/// The path this program was started from, as the PSP passed it, or null
+/// before `psp_main` runs.
+///
+/// Not in upstream psp 0.3.14. The working folder `_start` sets belongs to
+/// the main thread alone, so other threads need this to find the program's
+/// own files.
+pub static STARTED_FROM: core::sync::atomic::AtomicPtr<u8> = core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
 #[cfg(not(feature = "std"))]
 #[doc(hidden)]
 #[macro_export]
@@ -167,6 +175,7 @@ macro_rules! _start {
         }
 
         if $argc > 0 {
+            $crate::STARTED_FROM.store($argv as *mut u8, core::sync::atomic::Ordering::Relaxed);
             unsafe { init_cwd($argv as *mut u8) };
         }
 

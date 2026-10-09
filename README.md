@@ -139,7 +139,7 @@ shows what is happening.
 |---|---|
 | An amber light and "connecting" | Joining Wi-Fi or reaching Muse |
 | A green light and "online" | Ready. Hold R to talk. |
-| A red light and "offline" | Muse cannot be reached. The app keeps trying. |
+| A red light and "offline" | Muse has been out of reach for 45 seconds, or the PSP is not paired. The app keeps trying. |
 | The avatar in blue | Listening while you hold R |
 | The avatar in pink, with thought dots | Your question is on its way, or Muse is answering |
 | The avatar in green, with sound waves | Speaking the answer |
@@ -163,7 +163,7 @@ link/     the Muse client and the speech request, with no PSP code in them
 host/     programs that run link/ on a computer
 tools/    the avatar, pairing, installing
 tests/    the client against a fake Muse
-vendor/   the PSP library, with one system call added
+vendor/   the PSP library, with two small additions
 ```
 
 - **The Muse client** (`link/`) fetches your Muse's address over HTTPS, opens
@@ -179,8 +179,8 @@ vendor/   the PSP library, with one system call added
   PSP.
 - **Things the PSP made hard.** It has no hardware random source, so room
   noise from the microphone feeds the encryption. Its own name lookup could
-  hang forever, so the app does its own DNS. Large uploads stalled until they
-  were sent in small pieces.
+  hang forever, so the app does its own DNS. Its working folder belongs to
+  one thread, so every file is opened by its full path.
 
 ## Develop
 
@@ -213,8 +213,9 @@ every line. Read that first when something misbehaves on the PSP.
   is the best source the PSP offers.
 - **No voice without OpenAI.** There is no offline voice and no text on
   screen, so an answer that cannot be spoken is only signalled.
-- **Uploads are slow.** A two second question takes about ten seconds to
-  reach Muse on my PSP.
+- **Uploads are slow and sometimes stall.** A two second question takes
+  about ten seconds to reach Muse on my PSP, and now and then one fails and
+  has to be asked again.
 - **Long answers are spoken only in part.** About the first 420 characters.
 - **Muse sends text, not audio.** The voice is always made separately.
 

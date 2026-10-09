@@ -19,10 +19,11 @@ Muse Gadget SDK
 rust-psp
   vendor/psp
   https://github.com/overdrivenpotato/rust-psp
-  MIT License. This is version 0.3.14 of the psp crate with one addition in
-  src/sys/net.rs, the sceNetInetPoll call and its SceNetInetPollfd type,
-  which the upstream crate does not declare. The font in src/status.rs is
-  that crate's msxfont.bin.
+  MIT License. This is version 0.3.14 of the psp crate with two additions.
+  src/sys/net.rs gains the sceNetInetPoll call and its SceNetInetPollfd
+  type, which the upstream crate does not declare. src/lib.rs gains
+  STARTED_FROM, the path the program was started from. The font in
+  src/status.rs is that crate's msxfont.bin.
 
 Root certificates
   link/certs
