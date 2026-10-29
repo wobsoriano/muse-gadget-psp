@@ -614,7 +614,7 @@ impl<W: Wire> Session<W> {
             // one from a turn started in the Muse app is link.invoke on the
             // control stream.
             (Line::Invoke(invoke), _) => return self.run(invoke, app),
-            (Line::Busy(busy), Some(chat)) => chat.turn.busy(busy, now),
+            (Line::Status(status), Some(chat)) => chat.turn.status(status, now),
             (Line::Message(message), Some(chat)) => chat.turn.add(message, now),
             (Line::Unread, Some(chat)) => chat.turn.last_event_ms = now,
             _ => {}
@@ -745,7 +745,7 @@ impl<W: Wire> Session<W> {
                             // Without it no reply can ever be matched.
                             None => Some(Err("Muse acknowledged the message without naming it".into())),
                             Some(message_id) => {
-                                chat.turn.acknowledged(message_id);
+                                chat.turn.acknowledged(message_id, text(named, "reply_to_message_id"));
                                 chat.ack_body = Vec::new();
                                 chat.phase = Phase::Replying { started_ms: now };
                                 None
