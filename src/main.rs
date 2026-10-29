@@ -5,6 +5,7 @@ extern crate alloc;
 
 mod audio;
 mod avatar;
+mod call;
 mod clock;
 mod entropy;
 mod files;
@@ -18,6 +19,7 @@ mod store;
 mod voice;
 
 use avatar::{Avatar, Mood};
+use call::Line;
 use core::sync::atomic::Ordering;
 use psp::sys::{self, CtrlButtons, SceCtrlData};
 use report::Timer;
@@ -55,6 +57,7 @@ fn psp_main() {
         Ok(()) => {
             muse::start();
             voice::start();
+            call::start();
         }
         Err(why) => {
             say!("FAIL: {}", why);
@@ -63,10 +66,14 @@ fn psp_main() {
     }
     audio::start();
 
+    let mut call_mode = call::load_mode();
+    say!("mode: {}", if call_mode { "calls" } else { "voice notes" });
+
     let mut screen = Screen::open();
     let mut mood = Mood::Boot;
     let mut since = Timer::start();
     let mut shown_ms = 0;
+    let mut held = CtrlButtons::empty();
     loop {
         let now_ms = report::now_ms();
         let link = match muse::LINK.load(Ordering::Relaxed) {
@@ -76,9 +83,37 @@ fn psp_main() {
             _ => Link::Connecting,
         };
         let mut turn = muse::TURN.load(Ordering::Relaxed);
-        let may_talk = link == Link::Online && turn == muse::NO_QUESTION;
-        audio::TALKING.store(may_talk && pressed().contains(CtrlButtons::RTRIGGER), Ordering::Relaxed);
+        let pad = pressed();
+        let just_pressed = pad.difference(held);
+        held = pad;
+        // In call mode R talks on a call, so no voice note can start.
+        let may_talk = !call_mode && link == Link::Online && turn == muse::NO_QUESTION;
+        audio::TALKING.store(may_talk && pad.contains(CtrlButtons::RTRIGGER), Ordering::Relaxed);
         let speech = voice::STATE.load(Ordering::Relaxed);
+        // Voice-note mode shows nothing of calls, a call that just ended included.
+        let line = if call_mode { call::line(now_ms) } else { Line::Idle };
+        let talk = matches!(line, Line::Live { .. }) && pad.contains(CtrlButtons::RTRIGGER);
+        call::TALK.store(talk, Ordering::Relaxed);
+        if call_mode && just_pressed.contains(CtrlButtons::START) {
+            // A reply that could not be spoken stays FAILED until a voice
+            // note's turn ends, so only a voice that is busy holds off a call.
+            let voice_busy = matches!(speech, voice::PREPARING | voice::SPEAKING);
+            match line {
+                Line::Dialing | Line::Live { .. } => call::hang_up(),
+                _ if line.idle() && link == Link::Online && !voice_busy => call::dial(),
+                _ => {}
+            }
+        }
+        if just_pressed.contains(CtrlButtons::SELECT) && line.idle() && turn == muse::NO_QUESTION && !audio::RECORDING.load(Ordering::Relaxed) {
+            call_mode = !call_mode;
+            call::keep_mode(call_mode);
+            say!("mode: {}", if call_mode { "calls" } else { "voice notes" });
+            if !call_mode {
+                // Nothing draws the call's row in voice-note mode. Cleared
+                // here, before the avatar, which then redraws its own part.
+                status::clear_call(&mut screen);
+            }
+        }
         if turn == muse::ANSWERED {
             // The turn ends when the reply has been spoken. If it could not
             // be, the avatar celebrates the answer in silence for a moment.
@@ -92,7 +127,13 @@ fn psp_main() {
             }
         }
         let dancing = (muse::DANCE_UNTIL_MS.load(Ordering::Relaxed).wrapping_sub(now_ms) as i32) > 0;
+        let sounding = call_mode && call::sounding(now_ms);
         let next = match (audio::RECORDING.load(Ordering::Relaxed), speech, turn, link) {
+            _ if talk => Mood::Listening,
+            _ if sounding => Mood::Speaking,
+            _ if matches!(line, Line::Dialing | Line::Ending | Line::Live { working: true, .. }) => Mood::Thinking,
+            _ if matches!(line, Line::Ended { failed: true, .. }) => Mood::Error,
+            _ if matches!(line, Line::Live { .. }) => Mood::Idle,
             (true, _, _, _) => Mood::Listening,
             (_, voice::SPEAKING, _, _) => Mood::Speaking,
             (_, voice::FAILED, muse::ANSWERED, _) => Mood::Happy,
@@ -111,6 +152,9 @@ fn psp_main() {
         shown_ms += since.lap();
         avatar.draw(&mut screen, mood, shown_ms);
         status::draw(&mut screen, link, now_ms);
+        if call_mode {
+            status::draw_call(&mut screen, line, now_ms);
+        }
         screen.next_frame();
     }
 }

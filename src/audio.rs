@@ -1,14 +1,14 @@
 //! The microphone, on a thread of its own because a capture blocks for as
 //! long as the sound lasts.
 
-use crate::{entropy, muse};
+use crate::{call, entropy, muse};
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
 use psp::sys::{self, AudioInputFrequency, ThreadAttributes};
 
-const RATE: usize = 22_050;
-const CHUNK: usize = 512;
+pub const RATE: usize = 22_050;
+pub const CHUNK: usize = 512;
 const LONGEST_TAKE: usize = RATE * 12;
 /// A shorter take is a slip of the finger.
 const SHORTEST_TAKE: usize = RATE * 2 / 5;
@@ -55,6 +55,9 @@ unsafe extern "C" fn run(_: usize, _: *mut c_void) -> i32 {
         heard = heard.wrapping_add(1);
         if heard % 8 == 0 {
             noise(room);
+        }
+        if call::hear(room) {
+            continue;
         }
         if !TALKING.load(Ordering::Relaxed) {
             continue;

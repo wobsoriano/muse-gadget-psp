@@ -1,7 +1,7 @@
 //! The connection to Muse, on a thread of its own. Reaching Muse takes
 //! seconds at a time on a PSP, and the avatar must keep moving meanwhile.
 
-use crate::{clock, entropy, net, store, voice};
+use crate::{call, clock, entropy, net, store, voice};
 use alloc::{
     boxed::Box,
     format,
@@ -11,7 +11,7 @@ use alloc::{
 };
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, Ordering};
-use muse_link::{secure, App, Client, Clock, Config, Event, Lost, Net, Poll, Security, State};
+use muse_link::{secure, App, CallState, Client, Clock, Config, Ended, Event, Lost, Net, Poll, Security, State};
 use psp::sys::{self, ThreadAttributes};
 
 /// Which saved connection in the PSP's Network Settings to join. The first,
@@ -60,6 +60,9 @@ const COMMANDS: &str = r#"{
   "optional": {}
  }
 }"#;
+
+/// Muse's own voice is already on the line, and the call's speaker is busy.
+const ON_A_CALL: &str = "The user is on a voice call with you on this PSP right now. Say it in the call instead.";
 
 pub const NO_QUESTION: u8 = 0;
 pub const ASKED: u8 = 1;
@@ -188,7 +191,10 @@ impl App for Avatar {
                     TURN.store(NO_QUESTION, Ordering::Relaxed);
                 }
             }
-            Event::Call(state) => crate::say!("call: {:?}", state),
+            Event::Call(state) => {
+                crate::say!("call: {:?}", state);
+                call::show(state);
+            }
         }
     }
 
@@ -198,6 +204,9 @@ impl App for Avatar {
         match command {
             "psp.say" => {
                 let text = params["text"].as_str().map(str::trim).filter(|text| !text.is_empty()).ok_or("there is no text to say")?;
+                if call::on_call() {
+                    return Err(ON_A_CALL.into());
+                }
                 if voice::STATE.load(Ordering::Relaxed) != voice::SILENT {
                     return Err("the PSP is already speaking".into());
                 }
@@ -255,6 +264,16 @@ fn serve() -> Result<(), String> {
                 sys::sceKernelDelayThread(wait_ms.min(50) * 1000);
             },
             Poll::Unpaired => return Err("Muse no longer knows this PSP. It has to be paired again.".into()),
+        }
+        match call::take_ask() {
+            call::START => {
+                if let Err(refused) = client.call(Box::new(call::Pipes::open())) {
+                    crate::say!("call refused: {:?}", refused);
+                    call::show(CallState::Ended(Ended::Failed));
+                }
+            }
+            call::HANG_UP => client.hang_up(),
+            _ => {}
         }
         let fresh = taken();
         if let Some(wav) = &fresh {
