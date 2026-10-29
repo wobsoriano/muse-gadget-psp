@@ -442,7 +442,6 @@ fn main() {
                 }
                 called = true;
             }
-            // Hangs up once the second reply has played out and Muse has nothing in hand.
             let played_out = driver.room.borrow().heard(SECOND_REPLY) && driver.room.borrow().queued == 0;
             if name == "--call-barge" && !hung_up && played_out && matches!(driver.call, Some(CallState::Live { working: false, .. })) {
                 client.hang_up();

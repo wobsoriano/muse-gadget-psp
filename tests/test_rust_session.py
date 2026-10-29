@@ -27,7 +27,13 @@ WAV_BYTES = 100 * 1024
 DEVICE = "homelink-010203"
 FILE_LINE = "[file:"
 CALL_PATH = "/v1/noise?vm_id=vm%201&app_id=hatch-web"
-TENTH = 2400  # samples in 0.1 s at 24 kHz
+CALL_RATE = 24000
+SAMPLES_PER_TENTH_SECOND = CALL_RATE // 10
+TALK_MS = 1000
+TAIL_MS = 120
+APPEND_MS = 40
+FIRST_REPLY_TENTHS = 4 + 15
+GOODBYE_LIMIT_S = 5
 STAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z")
 
 
@@ -391,10 +397,9 @@ def test_call(driver, tmp_path):
     check_call_opened(call)
     assert call["order"] == ["media_request", "admission", "offer", "head", "session", "append", "end_call",
                              "end_call_answered", "half_close", "media_ended", "closed"]
-    # A 1 s talk and its 120 ms tail at 40 ms a record, then exact zeros until Muse's goodbye.
     appends = call["appends"]
     assert re.fullmatch(r"z+L+z+", appends), appends
-    assert abs(appends.count("L") - 28) <= 3, appends
+    assert abs(appends.count("L") - (TALK_MS + TAIL_MS) / APPEND_MS) <= 3, appends
     assert 22 <= (len(appends) - 1) / call["appending"] <= 28, "about 25 records a second, paced by the mic"
     assert call["half_close"] == 0, "the half-close is an empty body"
     assert (call["cancels"], call["resets"]) == ([], [])
@@ -402,10 +407,9 @@ def test_call(driver, tmp_path):
 
     audio = sounds(events)
     assert played(audio, 0) == 0, "no keepalive zeros played"
-    assert played(audio, 1111) == call["sent"]["p1"] == 19 * TENTH, "the reply, its held start included, in full"
-    # The reply was still playing when Muse said goodbye. Its 1.9 s play out
-    # before end-call, which waits 5 s at most.
-    assert 1.5 <= call["goodbye_to_end_call"] <= 6, call["goodbye_to_end_call"]
+    assert played(audio, 1111) == call["sent"]["p1"] == FIRST_REPLY_TENTHS * SAMPLES_PER_TENTH_SECOND, \
+        "the reply, its held start included, in full"
+    assert FIRST_REPLY_TENTHS / 10 - 0.4 <= call["goodbye_to_end_call"] <= GOODBYE_LIMIT_S + 1, call["goodbye_to_end_call"]
     assert phases(call_states(events)) == ["Dialing", "Live", "Ending", "Ended(Goodbye)"]
     assert "call over, end-call acknowledged: 0 advisory errors, 0 lines too long, 0 bad audio, 0 stray frames, " \
            "0 samples with no room, 0 ms of mic skipped" in [e[1] for e in events if e[0] == "log"]
@@ -426,9 +430,10 @@ def test_call_barge_in(driver, tmp_path):
     audio = sounds(events)
     first_reply = next(at for at, entry in enumerate(audio) if entry[:2] == ["play", 1111])
     interrupted = audio.index(["flush"], first_reply)
-    assert played(audio[:interrupted], 1111) >= 3 * TENTH, "the first reply played until the press"
+    assert played(audio[:interrupted], 1111) >= 3 * SAMPLES_PER_TENTH_SECOND, "the first reply played until the press"
     assert played(audio[interrupted:], 1111) == 0, "no stale r1 sample after the flush"
-    assert played(audio, 2222) == call["sent"]["p2"] == 9 * TENTH, "the second reply, its held start included"
+    assert played(audio, 2222) == call["sent"]["p2"] == 9 * SAMPLES_PER_TENTH_SECOND, \
+        "the second reply, its held start included"
     assert played(audio, 0) == 0
     assert ["hang_up"] in events
     assert phases(call_states(events)) == ["Dialing", "Live", "Ending", "Ended(HungUp)"]

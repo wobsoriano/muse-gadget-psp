@@ -325,7 +325,6 @@ impl<W: Wire> Call<W> {
                 self.uplink.hear(&capture[..samples], heard.talking)
             };
             if edge == Some(Edge::Pressed) {
-                // The reply that was playing never comes back.
                 self.cancel = self.gate.press().or(self.cancel.take());
                 self.apply_flush();
             }
@@ -405,7 +404,6 @@ impl<W: Wire> Call<W> {
             }
             Kind::Response { status, data, end } => {
                 self.feed(Input::Head(status), now);
-                // A refusal's body is nothing a call acts on.
                 (if (200..300).contains(&status) { data } else { &[][..] }, end)
             }
             Kind::Body { data, end } => (data, end),
@@ -450,7 +448,6 @@ impl<W: Wire> Call<W> {
                 self.thread_id = thread_id;
                 self.feed(Input::Ready, now);
             }
-            // Another call's, a second one, or one that names no session.
             (Stage::Ringing { .. } | Stage::Live { .. }, Down::Session { .. } | Down::BadSession) => self.feed(Input::Fatal(Ended::Failed), now),
             (Stage::Admitting { .. } | Stage::Ringing { .. }, Down::Error { .. }) | (Stage::Live { .. } | Stage::Goodbye { .. }, Down::Error { dead: true }) => {
                 self.feed(Input::Fatal(Ended::Failed), now)
@@ -586,7 +583,6 @@ impl<W: Wire> Call<W> {
                 self.media.up = false;
                 conn.send(self.media.stream, Part::Body { data: &[], end: true })?;
             }
-            // The connection closes next, so a reset that fails changes nothing.
             Act::Reset => {
                 if self.media.up || self.media.down {
                     let _ = conn.send(self.media.stream, Part::Reset { reason: "call ended" });
@@ -677,6 +673,7 @@ mod tests {
 
     const LIVE: Stage = Stage::Live { since_ms: 0, quiet_since_ms: 0 };
     const QUIET: CallState = CallState::Live { working: false, weak: false };
+    const MIC_RATE: u32 = 22_050;
 
     /// A network with nothing on it.
     struct Unplugged;
@@ -740,7 +737,7 @@ mod tests {
 
     impl CallAudio for Pipes {
         fn mic_rate(&self) -> u32 {
-            22_050
+            MIC_RATE
         }
         fn heard(&mut self, into: &mut [i16]) -> Option<Heard> {
             let heard = self.0.borrow_mut().mic.pop_front()?;
@@ -950,9 +947,14 @@ mod tests {
         assert_eq!(rig.call.uplink.next_line(), None, "and nothing goes up");
 
         rig.call.stage = LIVE;
-        // 1.36 s behind is not yet a skip. Past 1.5 s it skips until no more
-        // than a quarter second is left: 254 ms still skips, 227 ms does not.
-        let behind = [30_000, 44_100, 22_050, 5_600, 5_000, 0];
+        let behind_by = |ms: u64| (ms * u64::from(MIC_RATE) / 1000) as usize;
+        let just_under_skip = behind_by(LAG_SKIP_AT_MS - 100);
+        let well_past_skip = behind_by(2 * LAG_SKIP_AT_MS);
+        let half_skip = behind_by(LAG_SKIP_AT_MS / 2);
+        let just_over_keep = behind_by(LAG_KEEP_MS + 10);
+        let just_under_keep = behind_by(LAG_KEEP_MS - 10);
+        let none = 0;
+        let behind = [just_under_skip, well_past_skip, half_skip, just_over_keep, just_under_keep, none];
         rig.room.borrow_mut().mic.extend(behind.map(|behind| Heard { samples: 512, talking: false, behind }));
         rig.step();
         assert_eq!(rig.call.counts.skipped_mic, 3 * 512);

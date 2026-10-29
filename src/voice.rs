@@ -31,6 +31,12 @@ pub const SPEAKING: u8 = 2;
 pub const FAILED: u8 = 3;
 pub static STATE: AtomicU8 = AtomicU8::new(SILENT);
 
+/// Whether a reply is being fetched or spoken. FAILED is a result the
+/// screen clears later, not a busy speaker.
+pub fn busy() -> bool {
+    matches!(STATE.load(Ordering::Relaxed), PREPARING | SPEAKING)
+}
+
 static TEXT: AtomicPtr<String> = AtomicPtr::new(core::ptr::null_mut());
 
 /// The answer's samples. The fetch thread writes past `ARRIVED` and then

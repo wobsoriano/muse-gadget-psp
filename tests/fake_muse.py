@@ -78,7 +78,8 @@ BIG_TEXT = "badge " * 20000  # 120 KB, so the invoke spans two Noise chunks
 EXPECTED_ASKS = 3 if args.voice else 2
 DEAD_SECONDS = 70
 CALL = args.call or args.call_barge or args.call_reject or args.call_dead
-TENTH = 2400  # samples in 0.1 s at 24 kHz
+CALL_RATE = 24000
+SAMPLES_PER_TENTH_SECOND = CALL_RATE // 10
 FIRST_REPLY, SECOND_REPLY = 1111, 2222
 transcript = {"api": [], "vm": [], "dead_vm": [], "chats": [], "subscribes": 0,
               "connections": 0, "voice": None, "knocks": [], "chat_invoke_result": None, "call": None,
@@ -330,7 +331,6 @@ class Call:
                 if frame.kind == "request":
                     self.on_request(frame)
                 elif frame.kind == "body_chunk" and frame.stream_id == self.media:
-                    # Each record is its own body chunk.
                     for line in frame.value.data.splitlines():
                         self.on_record(json.loads(line))
                     if frame.value.end_body:
@@ -413,7 +413,8 @@ class Call:
     def reply(self, name, response_id, sample, samples):
         """A reply in records of 0.1 s, counted as sent."""
         self.log["sent"][name] += samples
-        return [voice(sample, min(TENTH, samples - start), response_id) for start in range(0, samples, TENTH)]
+        tenth = SAMPLES_PER_TENTH_SECOND
+        return [voice(sample, min(tenth, samples - start), response_id) for start in range(0, samples, tenth)]
 
     async def answer_end_call(self):
         """Answers end-call a moment late, so a half-close sent before the answer would show."""
@@ -451,12 +452,11 @@ class Call:
         await self.until(lambda: self.talked(1), "talk")
         # The start of the reply comes before the turn that confirms it, so it is held.
         await self.send(speech("started", "i1"), speech("stopped", "i1"), response("created", "r1"),
-                        *self.reply("p1", "r1", FIRST_REPLY, 4 * TENTH), turn("m1", "i1"))
+                        *self.reply("p1", "r1", FIRST_REPLY, 4 * SAMPLES_PER_TENTH_SECOND), turn("m1", "i1"))
         if args.call_barge:
             return await self.barge()
-        # Zeros behind more than a second of queued speech only add delay.
-        await self.send(*self.reply("p1", "r1", FIRST_REPLY, 15 * TENTH), KEEPALIVE, response("done", "r1"),
-                        settled("m1"), {"type": "conversation.item.added", "item": {
+        await self.send(*self.reply("p1", "r1", FIRST_REPLY, 15 * SAMPLES_PER_TENTH_SECOND), KEEPALIVE,
+                        response("done", "r1"), settled("m1"), {"type": "conversation.item.added", "item": {
                             "type": "session_control", "name": " STOP ", "call_id": "ctl-9", "arguments": "{}"}})
         self.goodbye_at = time.monotonic()
         await self.close_down()
@@ -466,16 +466,17 @@ class Call:
         for _ in range(100):
             if self.log["cancels"]:
                 break
-            await self.send(*self.reply("p1", "r1", FIRST_REPLY, TENTH))
+            await self.send(*self.reply("p1", "r1", FIRST_REPLY, SAMPLES_PER_TENTH_SECOND))
             await asyncio.sleep(0.1)
         else:
             raise TimeoutError("no cancel")
-        await self.send(*self.reply("stale", "r1", FIRST_REPLY, 3 * TENTH), response("done", "r1", "cancelled"),
-                        settled("m1"), speech("started", "i2"))
+        await self.send(*self.reply("stale", "r1", FIRST_REPLY, 3 * SAMPLES_PER_TENTH_SECOND),
+                        response("done", "r1", "cancelled"), settled("m1"), speech("started", "i2"))
         await self.until(lambda: self.talked(2), "second talk")
         await self.send(speech("stopped", "i2"), response("created", "r2"),
-                        *self.reply("p2", "r2", SECOND_REPLY, 3 * TENTH), turn("m2", "i2"),
-                        *self.reply("p2", "r2", SECOND_REPLY, 6 * TENTH), response("done", "r2"), settled("m2"))
+                        *self.reply("p2", "r2", SECOND_REPLY, 3 * SAMPLES_PER_TENTH_SECOND), turn("m2", "i2"),
+                        *self.reply("p2", "r2", SECOND_REPLY, 6 * SAMPLES_PER_TENTH_SECOND), response("done", "r2"),
+                        settled("m2"))
         await self.close_down()
 
 
@@ -532,7 +533,6 @@ async def vm_handler(ws):
         return
 
     if CALL:
-        # A command while the call is up shows the link session is still served.
         await asyncio.wait_for(call_open.wait(), 30)
         await vm.send_message({"method": "link.invoke", "id": "inv-call", "command": "badge.show_message",
                                "params": {"text": "on a call"}})

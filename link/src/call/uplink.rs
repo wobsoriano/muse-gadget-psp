@@ -263,8 +263,6 @@ mod tests {
             uplink.hear(&loud, false);
         }
         out.extend(sent(&mut uplink));
-        // The mic heard 1000 throughout. The real audio ends at this mic
-        // sample, and an output at position k is at k * 147 / 160 of it.
         let end = 3 * CHUNK + 20 * CHUNK + 22_050 * TAIL_MS / 1000;
         let real_outputs = (end * 160).div_ceil(147);
         let first_loud = (3 * CHUNK * 160).div_ceil(147);

@@ -52,11 +52,7 @@ impl<T: Copy + Send> Ring<T> {
         let Some((slots, mask)) = self.storage() else { return 0 };
         let put = self.put.load(Ordering::Relaxed);
         let taken = self.taken.load(Ordering::Acquire);
-        // A drop the taker has passed moves up to it, so the counters can
-        // wrap all the way round without it looking new again.
-        if (self.drop_before.load(Ordering::Relaxed).wrapping_sub(taken) as i32) < 0 {
-            self.drop_before.store(taken, Ordering::Release);
-        }
+        self.retire_passed_drop(taken);
         let count = (mask + 1 - put.wrapping_sub(taken) as usize).min(items.len());
         for (offset, &item) in items[..count].iter().enumerate() {
             unsafe { slots.add(put.wrapping_add(offset as u32) as usize & mask).write(item) };
@@ -114,6 +110,13 @@ impl<T: Copy + Send> Ring<T> {
             skip
         } else {
             taken
+        }
+    }
+
+    /// Moves a drop the taker has passed up to it, so a counter wrap never revives it.
+    fn retire_passed_drop(&self, taken: u32) {
+        if (self.drop_before.load(Ordering::Relaxed).wrapping_sub(taken) as i32) < 0 {
+            self.drop_before.store(taken, Ordering::Release);
         }
     }
 

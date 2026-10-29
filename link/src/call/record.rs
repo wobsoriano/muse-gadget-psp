@@ -96,7 +96,6 @@ pub(crate) fn parse(line: &[u8]) -> Down {
 }
 
 fn session(event: &Value) -> Down {
-    // A session or thread id of only spaces names nothing.
     let named = |key: &str| Id::parse(event.get(key)).filter(|id| !id.0.trim().is_empty());
     let thread_id = match event.get("thread_id") {
         None | Some(Value::Null) => Some(None),
@@ -158,13 +157,15 @@ pub(crate) fn admission(call_id: &str, device_id: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Three samples are six bytes, which base64 takes without padding.
+const SAMPLES_PER_BASE64_GROUP: usize = 3;
+
 /// Writes the record for `pcm` over `line`.
 pub(crate) fn append(pcm: &[i16], line: &mut Vec<u8>) {
     line.clear();
     line.extend_from_slice(b"{\"type\":\"input_audio_buffer.append\",\"audio\":\"");
-    let mut bytes = [0u8; 6];
-    // Three samples are six bytes, which base64 takes without padding.
-    for samples in pcm.chunks(3) {
+    let mut bytes = [0u8; 2 * SAMPLES_PER_BASE64_GROUP];
+    for samples in pcm.chunks(SAMPLES_PER_BASE64_GROUP) {
         for (pair, sample) in bytes.chunks_exact_mut(2).zip(samples) {
             pair.copy_from_slice(&sample.to_le_bytes());
         }

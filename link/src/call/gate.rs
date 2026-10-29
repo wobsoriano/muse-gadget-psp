@@ -136,7 +136,6 @@ impl Gate {
         } else if self.item.is_none() || self.blocked {
             Reply::Stale
         } else if self.confirmed {
-            // A newer reply takes over: two never interleave.
             self.flush.playing |= self.playing();
             self.replace(&[Reply::Playing, Reply::Continuing], Reply::Stale);
             let reply = if self.turn_fresh { Reply::Playing } else { Reply::Continuing };
