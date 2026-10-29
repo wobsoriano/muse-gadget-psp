@@ -1,22 +1,21 @@
-//! One session with a Muse VM: the WebSocket, the Noise handshake inside it,
-//! registration, commands, and one chat turn at a time. Ported from the Muse
-//! Gadget SDK's link_client.py onto one thread: each step reads for a short
-//! while and does the keepalive and the chat turn in between.
+//! One session with a Muse VM on its own connection: registration,
+//! commands, and one chat turn at a time. Ported from the Muse Gadget SDK's
+//! link_client.py onto one thread: each step reads for a short while and does
+//! the keepalive and the chat turn in between.
 
-use crate::channel::{Channel, Fault, Security};
+use crate::channel::{Fault, Security};
 use crate::client::{App, Event};
-use crate::noise::{self, Handshake, Kind, Part};
+use crate::connection::{Answer, Connection, Hello, Next, OPEN_PATIENCE_MS};
+use crate::noise::{self, Kind, Part};
 use crate::turn::{text, truthy, Invoke, Line, Turn};
 use crate::url::Endpoint;
-use crate::{http, ws, Clock, Net, Wire};
-use alloc::{format, string::String, string::ToString, vec, vec::Vec};
+use crate::{ws, Clock, Net, Wire};
+use alloc::{format, string::String, string::ToString, vec::Vec};
 use core::fmt::Write;
 use serde::de::IgnoredAny;
 use serde_json::{json, Value};
-use zeroize::Zeroizing;
 
 const APP_ID: &str = "musegadget";
-const READ_SIZE: usize = 4096;
 /// The most frames one step handles before giving the caller its turn.
 const FRAMES_PER_STEP: usize = 32;
 const BODY_PIECE: usize = 16 * 1024;
@@ -28,17 +27,12 @@ const LARGEST_CONTROL_MESSAGE: usize = 256 * 1024;
 const LARGEST_ACK: usize = 64 * 1024;
 const LARGEST_EVENT_LINE: usize = 256 * 1024;
 
-const OPEN_PATIENCE_MS: u64 = 20_000;
 const ACK_PATIENCE_MS: u64 = 60_000;
 const FIRST_REPLY_PATIENCE_MS: u64 = 300_000;
 const LONGEST_TURN_MS: u64 = 900_000;
 /// A whole reply followed by this much silence is almost always the answer.
 const SETTLED_AFTER_MS: u64 = 350;
 const DONE_AFTER_MS: u64 = 3_000;
-const PING_EVERY_MS: u64 = 15_000;
-// A real PSP's uplink has stalled for whole seconds at a time and then
-// recovered, so a session is not given up on quickly.
-const PONG_PATIENCE_MS: u64 = 30_000;
 
 macro_rules! log {
     ($app:expr, $($format:tt)*) => {
@@ -66,29 +60,13 @@ impl From<Fault> for End {
     }
 }
 
-impl From<noise::Broken> for Fault {
-    fn from(_: noise::Broken) -> Self {
-        Fault::Protocol
-    }
-}
-
 impl From<noise::Broken> for End {
     fn from(_: noise::Broken) -> Self {
         End::Failed(Fault::Protocol)
     }
 }
 
-impl From<ws::Bad> for Fault {
-    fn from(_: ws::Bad) -> Self {
-        Fault::Protocol
-    }
-}
-
-/// The first Noise message with the keys behind it. Made before connecting,
-/// and kept across attempts until a connection uses it.
-pub(crate) type Hello = (Handshake, [u8; 32]);
-
-fn uuid4() -> Result<String, Fault> {
+pub(crate) fn uuid4() -> Result<String, Fault> {
     let mut bytes = [0u8; 16];
     getrandom::getrandom(&mut bytes).map_err(|_| Fault::Protocol)?;
     bytes[6] = bytes[6] & 0x0F | 0x40;
@@ -168,105 +146,23 @@ struct Chat {
     voice: bool,
     stream: i64,
     turn: Turn,
-    ack_status: i32,
-    ack_body: Vec<u8>,
-    /// Set once the answer to the chat request is whole, or has failed.
-    ack: Option<Result<(), String>>,
+    /// The answer to the chat request.
+    ack: Answer,
     /// The reply as last shown to the app.
     shown: String,
     draft: String,
     settled: bool,
 }
 
-impl Chat {
-    fn on_ack(&mut self, kind: Kind) {
-        if self.ack.is_some() {
-            return;
-        }
-        let (data, end) = match kind {
-            Kind::Reset { reason } => return self.ack = Some(Err(format!("stream reset: {reason}"))),
-            Kind::Response { status, data, end } => {
-                self.ack_status = status;
-                (data, end)
-            }
-            Kind::Body { data, end } => (data, end),
-        };
-        if self.ack_body.len() + data.len() > LARGEST_ACK {
-            self.ack = Some(Err("response too large".into()));
-            return;
-        }
-        self.ack_body.extend_from_slice(data);
-        if end {
-            self.ack = Some(Ok(()));
-        }
-    }
-}
-
-/// The WebSocket: frames in and out over the connection.
-struct Socket<W> {
-    channel: Channel<W>,
-    reader: ws::Reader,
-    rx: Vec<u8>,
-    rx_at: usize,
-    rx_end: usize,
-    out: Vec<u8>,
-    last_rx_ms: u64,
-}
-
-impl<W: Wire> Socket<W> {
-    fn send(&mut self, opcode: u8, payload: &[u8]) -> Result<(), Fault> {
-        self.out.clear();
-        ws::begin(&mut self.out, opcode, payload.len());
-        self.out.extend_from_slice(payload);
-        self.channel.write_all(&self.out)
-    }
-
-    /// The next frame, waiting up to `wait_ms` for bytes when none are at
-    /// hand. Pings are answered here. A message is left in `reader.message`.
-    fn next(&mut self, mut wait_ms: u32, clock: &impl Clock) -> Result<Option<ws::Got>, Fault> {
-        loop {
-            if self.rx_at < self.rx_end {
-                let mut input = &self.rx[self.rx_at..self.rx_end];
-                let got = self.reader.next(&mut input)?;
-                self.rx_at = self.rx_end - input.len();
-                match got {
-                    Some(ws::Got::Ping(len)) => {
-                        let payload = self.reader.control;
-                        self.send(ws::PONG, &payload[..len])?;
-                        continue;
-                    }
-                    Some(got) => return Ok(Some(got)),
-                    None => {}
-                }
-            }
-            match self.channel.read_soon(&mut self.rx, wait_ms)? {
-                None => return Ok(None),
-                Some(0) => return Err(Fault::Closed),
-                Some(got) => {
-                    (self.rx_at, self.rx_end) = (0, got);
-                    self.last_rx_ms = clock.millis();
-                    // A frame that trickles in is finished on a later call.
-                    wait_ms = 0;
-                }
-            }
-        }
-    }
-}
-
 pub(crate) struct Session<W: Wire> {
-    socket: Socket<W>,
-    sender: noise::Sender,
-    receiver: noise::Receiver,
+    connection: Connection<W>,
     device_id: String,
     control: i64,
     control_rx: Vec<u8>,
     register_id: String,
     pub registered_at_ms: Option<u64>,
-    opened_ms: u64,
     subscription: Option<Subscription>,
     chat: Option<Chat>,
-    ping_cycle_ms: u64,
-    ping_sent_ms: Option<u64>,
 }
 
 impl<W: Wire> Session<W> {
@@ -283,101 +179,18 @@ impl<W: Wire> Session<W> {
         register: &Value,
         hello: &mut Option<Hello>,
     ) -> Result<Self, Fault> {
-        if hello.is_none() {
-            *hello = Some(Handshake::begin()?);
-        }
-        let deadline = clock.millis() + OPEN_PATIENCE_MS;
-        let mut channel = Channel::open(net, security, to)?;
-
-        let mut random = [0u8; 16];
-        getrandom::getrandom(&mut random).map_err(|_| Fault::Protocol)?;
-        let key = ws::key(random);
-        let authorization = Zeroizing::new(format!("Bearer {bearer}"));
-        let headers = [
-            ("Upgrade", "websocket"),
-            ("Connection", "Upgrade"),
-            ("Sec-WebSocket-Key", key.as_str()),
-            ("Sec-WebSocket-Version", "13"),
-            ("Authorization", authorization.as_str()),
-        ];
-        let request = Zeroizing::new(http::head("GET", to, &headers));
-        channel.write_all(request.as_bytes())?;
-
-        let mut head = vec![0u8; http::LARGEST_HEAD + READ_SIZE];
-        let mut filled = 0;
-        let head_end = loop {
-            if let Some(end) = http::head_end(&head[..filled]) {
-                break end;
-            }
-            if filled >= http::LARGEST_HEAD {
-                return Err(Fault::Protocol);
-            }
-            if clock.millis() >= deadline {
-                return Err(Fault::Timeout);
-            }
-            match channel.read_soon(&mut head[filled..filled + READ_SIZE], 250)? {
-                None => {}
-                // Hanging up ends the head, as it does to the reference client.
-                Some(0) => break filled,
-                Some(got) => filled += got,
-            }
-        };
-        let text = core::str::from_utf8(&head[..head_end]).map_err(|_| Fault::Protocol)?;
-        match http::status(text).ok_or(Fault::Protocol)? {
-            101 => {}
-            status => return Err(Fault::Refused(status)),
-        }
-        if http::header(text, "sec-websocket-accept") != Some(ws::accept(&key).as_str()) {
-            return Err(Fault::Protocol);
-        }
-
-        // Whatever came after the head in the same read belongs to the socket.
-        let early = &head[head_end..filled];
-        let mut rx = vec![0u8; READ_SIZE.max(early.len())];
-        rx[..early.len()].copy_from_slice(early);
-        let now = clock.millis();
-        let mut socket = Socket {
-            channel,
-            reader: ws::Reader::new(),
-            rx,
-            rx_at: 0,
-            rx_end: early.len(),
-            out: Vec::with_capacity(READ_SIZE),
-            last_rx_ms: now,
-        };
-        // Taken before its first message goes out, so the keys are never
-        // offered twice. A refusal at the upgrade above leaves them unused.
-        let (handshake, first) = hello.take().ok_or(Fault::Protocol)?;
-        socket.send(ws::BINARY, &first)?;
-        loop {
-            match socket.next(250, clock)? {
-                Some(ws::Got::Message(ws::BINARY)) => break,
-                Some(ws::Got::Message(_)) => return Err(Fault::Protocol),
-                Some(ws::Got::Close) => return Err(Fault::Closed),
-                _ if clock.millis() >= deadline => return Err(Fault::Timeout),
-                _ => {}
-            }
-        }
-        let (third, sender, receiver) = handshake.finish(&socket.reader.message)?;
-        socket.send(ws::BINARY, &third)?;
-
         let mut session = Session {
-            socket,
-            sender,
-            receiver,
+            connection: Connection::open(net, clock, security, to, bearer, hello)?,
             device_id: device_id.into(),
             control: 0,
             control_rx: Vec::new(),
             register_id: uuid4()?,
             registered_at_ms: None,
-            opened_ms: now,
             subscription: None,
             chat: None,
-            ping_cycle_ms: now,
-            ping_sent_ms: None,
         };
-        session.control = session.sender.new_stream();
-        session.send(session.control, Part::Request { path: "/link-control", headers: &[], body: &[], end: false })?;
+        session.control = session.connection.new_stream();
+        session.connection.send(session.control, Part::Request { path: "/link-control", headers: &[], body: &[], end: false })?;
         let register = json!({"type": "req", "id": session.register_id, "method": "link.register", "params": register});
         session.send_control(register.to_string().as_bytes())?;
         Ok(session)
@@ -387,26 +200,12 @@ impl<W: Wire> Session<W> {
         self.chat.is_some()
     }
 
-    /// Every sealed message goes through here, in the order it was sealed:
-    /// the VM counts them.
-    fn send(&mut self, stream: i64, part: Part) -> Result<(), Fault> {
-        let total = self.sender.stage(stream, &part)?;
-        for index in 0..total {
-            let out = &mut self.socket.out;
-            out.clear();
-            ws::begin(out, ws::BINARY, self.sender.sealed_len(index));
-            self.sender.seal(index, out)?;
-            self.socket.channel.write_all(out)?;
-        }
-        Ok(())
-    }
-
     /// A control message is JSON behind its length as four bytes, low first.
     fn send_control(&mut self, json: &[u8]) -> Result<(), Fault> {
         let mut framed = Vec::with_capacity(4 + json.len());
         framed.extend_from_slice(&(json.len() as u32).to_le_bytes());
         framed.extend_from_slice(json);
-        self.send(self.control, Part::Body { data: &framed, end: false })
+        self.connection.send(self.control, Part::Body { data: &framed, end: false })
     }
 
     /// One slice of the session: reads for up to `wait_ms`, then the
@@ -422,28 +221,32 @@ impl<W: Wire> Session<W> {
             if self.registered_at_ms.is_some() != was_registered {
                 return Ok(());
             }
-            match self.socket.next(wait_ms, clock)? {
-                None => break,
-                Some(ws::Got::Message(ws::BINARY)) => {
-                    let mut message = core::mem::take(&mut self.socket.reader.message);
+            match self.connection.next(wait_ms, clock)? {
+                Next::Nothing => break,
+                Next::Message(mut message) => {
                     let handled = self.on_message(&mut message, clock.millis(), app);
-                    self.socket.reader.message = message;
+                    self.connection.recycle(message);
                     handled?;
                 }
-                Some(ws::Got::Close) => {
+                Next::Closed => {
                     log!(app, "the VM closed the connection");
                     return Err(Fault::Closed.into());
                 }
-                Some(_) => {}
+                Next::Other => {}
             }
             wait_ms = 0;
         }
         let now = clock.millis();
-        if self.registered_at_ms.is_none() && now.saturating_sub(self.opened_ms) > OPEN_PATIENCE_MS {
+        if self.registered_at_ms.is_none() && now.saturating_sub(self.connection.opened_ms) > OPEN_PATIENCE_MS {
             log!(app, "the VM did not answer link.register");
             return Err(Fault::Timeout.into());
         }
-        self.keepalive(now, app)?;
+        if let Err(fault) = self.connection.keepalive(now) {
+            if fault == Fault::Quiet {
+                log!(app, "the connection to Muse went quiet");
+            }
+            return Err(fault.into());
+        }
         self.chat_step(now, app, ask)
     }
 
@@ -452,11 +255,11 @@ impl<W: Wire> Session<W> {
         if let Some(chat) = self.chat.take() {
             app.event(Event::Failed { text: &chat.shown, why: "session ended" });
         }
-        let _ = self.socket.send(ws::CLOSE, &[]);
+        self.connection.close();
     }
 
     fn on_message(&mut self, message: &mut [u8], now: u64, app: &mut impl App) -> Result<(), End> {
-        let Some(envelope) = self.receiver.open(message, now)? else { return Ok(()) };
+        let Some(envelope) = self.connection.open_message(message, now)? else { return Ok(()) };
         let Some(frame) = noise::decode(&envelope)? else { return Ok(()) };
         if frame.stream == self.control {
             return self.on_control(frame.kind, now, app);
@@ -465,7 +268,7 @@ impl<W: Wire> Session<W> {
             return self.on_subscription(frame.kind, now, app);
         }
         if let Some(chat) = self.chat.as_mut().filter(|chat| chat.stream == frame.stream) {
-            chat.on_ack(frame.kind);
+            chat.ack.feed(frame.kind);
         }
         Ok(())
     }
@@ -622,29 +425,6 @@ impl<W: Wire> Session<W> {
         Ok(())
     }
 
-    /// A read on a dead connection only ever times out, so a ping that draws
-    /// no frame of any kind is what ends the session. Silence alone never
-    /// does: the app may simply not have polled for a while, and whatever
-    /// arrived meanwhile is read before this runs.
-    fn keepalive(&mut self, now: u64, app: &mut impl App) -> Result<(), End> {
-        match self.ping_sent_ms {
-            Some(sent) if self.socket.last_rx_ms >= sent => {
-                self.ping_sent_ms = None;
-                self.ping_cycle_ms = now;
-                return Ok(());
-            }
-            Some(sent) if now.saturating_sub(sent) <= PONG_PATIENCE_MS => return Ok(()),
-            Some(_) => {}
-            None if now.saturating_sub(self.ping_cycle_ms) < PING_EVERY_MS => return Ok(()),
-            None => {
-                self.ping_sent_ms = Some(now);
-                return Ok(self.socket.send(ws::PING, &[])?);
-            }
-        }
-        log!(app, "the connection to Muse went quiet");
-        Err(Fault::Quiet.into())
-    }
-
     fn chat_step(&mut self, now: u64, app: &mut impl App, ask: &mut Option<Ask>) -> Result<(), End> {
         let Some(mut chat) = self.chat.take() else {
             if self.registered_at_ms.is_none() {
@@ -671,17 +451,17 @@ impl<W: Wire> Session<W> {
 
     fn start_chat(&mut self, ask: Ask, now: u64) -> Result<Chat, Fault> {
         if self.subscription.as_ref().is_none_or(|subscription| subscription.closed.is_some()) {
-            let (stream, request_id) = (self.sender.new_stream(), uuid4()?);
+            let (stream, request_id) = (self.connection.new_stream(), uuid4()?);
             let headers = [
                 ("Content-Type", "application/json"),
                 ("accept", "application/x-ndjson"),
                 ("x-request-id", request_id.as_str()),
                 ("x-app-id", APP_ID),
             ];
-            self.send(stream, Part::Request { path: "/chat/subscribe", headers: &headers, body: b"{}", end: true })?;
+            self.connection.send(stream, Part::Request { path: "/chat/subscribe", headers: &headers, body: b"{}", end: true })?;
             self.subscription = Some(Subscription { stream, line: Vec::new(), closed: None });
         }
-        let (stream, request_id) = (self.sender.new_stream(), uuid4()?);
+        let (stream, request_id) = (self.connection.new_stream(), uuid4()?);
         let headers = [("x-request-id", request_id.as_str()), ("x-app-id", APP_ID), ("Content-Type", "application/json")];
         let path = "/chat/stream";
         // device_id is what has Muse take the turn as this device's, and
@@ -689,11 +469,11 @@ impl<W: Wire> Session<W> {
         let (phase, voice) = match ask {
             Ask::Text(message) => {
                 let body = json!({"message": message, "output_modality": "text", "device_id": self.device_id}).to_string();
-                self.send(stream, Part::Request { path, headers: &headers, body: body.as_bytes(), end: true })?;
+                self.connection.send(stream, Part::Request { path, headers: &headers, body: body.as_bytes(), end: true })?;
                 (Phase::AwaitingAck { sent_ms: now }, false)
             }
             Ask::Voice(wav) => {
-                self.send(stream, Part::Request { path, headers: &headers, body: &[], end: false })?;
+                self.connection.send(stream, Part::Request { path, headers: &headers, body: &[], end: false })?;
                 (Phase::Sending(Upload::new(wav, &self.device_id)), true)
             }
         };
@@ -702,9 +482,7 @@ impl<W: Wire> Session<W> {
             voice,
             stream,
             turn: Turn::new(now),
-            ack_status: 0,
-            ack_body: Vec::new(),
-            ack: None,
+            ack: Answer::new(LARGEST_ACK),
             shown: String::new(),
             draft: String::new(),
             settled: false,
@@ -716,13 +494,13 @@ impl<W: Wire> Session<W> {
         let started_ms = match &mut chat.phase {
             Phase::Sending(upload) => {
                 // The VM can refuse the stream while the body is still going out.
-                if chat.ack.as_ref().is_some_and(Result::is_err) {
-                    return Ok(chat.ack.take());
+                if chat.ack.done.as_ref().is_some_and(Result::is_err) {
+                    return Ok(chat.ack.done.take());
                 }
                 for _ in 0..PIECES_PER_STEP {
                     let (piece, last) = upload.piece();
                     let len = piece.len();
-                    self.send(chat.stream, Part::Body { data: piece, end: last })?;
+                    self.connection.send(chat.stream, Part::Body { data: piece, end: last })?;
                     upload.sent(len);
                     if last {
                         chat.phase = Phase::AwaitingAck { sent_ms: now };
@@ -733,20 +511,20 @@ impl<W: Wire> Session<W> {
             }
             Phase::AwaitingAck { sent_ms } => {
                 let sent_ms = *sent_ms;
-                return Ok(match chat.ack.take() {
+                return Ok(match chat.ack.done.take() {
                     Some(Err(why)) => Some(Err(why)),
-                    Some(Ok(())) if !(200..300).contains(&chat.ack_status) => {
-                        Some(Err(format!("Muse did not take the message: HTTP {}", chat.ack_status)))
+                    Some(Ok(())) if !(200..300).contains(&chat.ack.status) => {
+                        Some(Err(format!("Muse did not take the message: HTTP {}", chat.ack.status)))
                     }
                     Some(Ok(())) => {
-                        let answer = serde_json::from_slice::<Value>(&chat.ack_body).unwrap_or_default();
+                        let answer = serde_json::from_slice::<Value>(&chat.ack.body).unwrap_or_default();
                         let named = answer.get("result").filter(|result| result.is_object()).unwrap_or(&answer);
                         match text(named, "message_id") {
                             // Without it no reply can ever be matched.
                             None => Some(Err("Muse acknowledged the message without naming it".into())),
                             Some(message_id) => {
                                 chat.turn.acknowledged(message_id);
-                                chat.ack_body = Vec::new();
+                                chat.ack.body = Vec::new();
                                 chat.phase = Phase::Replying { started_ms: now };
                                 None
                             }

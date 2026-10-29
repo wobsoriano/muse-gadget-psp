@@ -7,8 +7,9 @@
 //! [`App`] during that call.
 
 use crate::channel::{Fault, Security};
+use crate::connection::Hello;
 use crate::pace::{Backoff, Door, REFUSED_WAIT_MS};
-use crate::session::{log, Ask, End, Hello, Session, LARGEST_WAV};
+use crate::session::{log, Ask, End, Session, LARGEST_WAV};
 use crate::url::{encode_component, Endpoint};
 use crate::{api, Clock, Net};
 use alloc::{format, string::String, vec::Vec};

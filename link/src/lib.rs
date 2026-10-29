@@ -16,6 +16,7 @@ pub mod wav;
 mod api;
 mod channel;
 mod client;
+mod connection;
 mod http;
 mod noise;
 mod pace;
