@@ -230,9 +230,6 @@ pub struct Client<N: Net, C: Clock, V: Vault> {
     /// dead, so nothing else happens until these are saved.
     unsaved: Option<Pairing>,
     refresh_tried_ms: Option<u64>,
-    /// The SDK token reaches Muse only in a refresh, so each start with one
-    /// refreshes once to report it.
-    sdk_token_reported: bool,
     /// The API rejected the access token on the round before this one.
     rejected: bool,
     state: State,
@@ -288,7 +285,6 @@ impl<N: Net, C: Clock, V: Vault> Client<N, C, V> {
             pairing,
             unsaved: None,
             refresh_tried_ms: None,
-            sdk_token_reported: false,
             rejected: false,
             state: State::Connecting,
             phase: Phase::Start,
@@ -426,25 +422,19 @@ impl<N: Net, C: Clock, V: Vault> Client<N, C, V> {
     /// Rotates the tokens if they are due. `force` is for when the API has
     /// just rejected the access token.
     fn refresh(&mut self, app: &mut impl App, now: u64, force: bool) -> Refresh {
-        let report_due = self.sdk_token.is_some() && !self.sdk_token_reported;
         // A clock that was never set, or an age below zero, says nothing
         // about the token.
         let age = match (self.clock.unix_seconds(), self.pairing.saved_at) {
             (Some(unix), saved_at) if saved_at > 0 => unix.checked_sub(saved_at),
             _ => None,
         };
-        let due = force || age.is_none_or(|age| age >= REFRESH_AGE_S);
-        if !due && !report_due {
+        if !force && age.is_some_and(|age| age < REFRESH_AGE_S) {
             return Refresh::Proceed;
         }
         if !force && self.refresh_tried_ms.is_some_and(|tried| now.saturating_sub(tried) < REFRESH_RETRY_MS) {
             return Refresh::Proceed;
         }
         self.refresh_tried_ms = Some(now);
-        if report_due {
-            self.sdk_token_reported = true;
-            log!(app, "refreshing the device token to report the SDK token");
-        }
         let rotated = api::refresh(
             &mut self.net,
             &self.clock,
@@ -465,12 +455,6 @@ impl<N: Net, C: Clock, V: Vault> Client<N, C, V> {
                 }
                 self.pairing = rotated;
                 log!(app, "device token rotated");
-                Refresh::Proceed
-            }
-            // Only reporting the SDK token: nothing has rejected the current
-            // token, so a refusal here must never unpair the device.
-            Err(fault) if !due => {
-                log!(app, "the SDK token report failed ({fault:?}), keeping the pairing");
                 Refresh::Proceed
             }
             Err(Fault::Refused(401)) => {
@@ -587,7 +571,8 @@ impl<N: Net, C: Clock, V: Vault> Client<N, C, V> {
 mod tests {
     use super::*;
     use crate::{secure, Lost, Stream, Wire};
-    use alloc::sync::Arc;
+    use alloc::{rc::Rc, sync::Arc};
+    use core::cell::Cell;
     use rustls::pki_types::UnixTime;
     use rustls::time_provider::TimeProvider;
 
@@ -650,6 +635,42 @@ mod tests {
         change(&mut config);
         let pairing = Pairing { access_token: "a".into(), refresh_token: "r".into(), saved_at: 0 };
         Client::new(config, pairing, Security::Tls(secure::settings(Arc::new(NoDate)).unwrap()), Nowhere, Nowhere, Nowhere)
+    }
+
+    struct Dated(u64);
+    impl Clock for Dated {
+        fn millis(&self) -> u64 {
+            0
+        }
+        fn unix_seconds(&self) -> Option<u64> {
+            Some(self.0)
+        }
+    }
+    struct Counting(Rc<Cell<usize>>);
+    impl Net for Counting {
+        type Wire = Nowhere;
+        fn open(&mut self, _: &str, _: u16) -> Result<Nowhere, Lost> {
+            self.0.set(self.0.get() + 1);
+            Err(Lost)
+        }
+    }
+
+    #[test]
+    fn the_token_is_rotated_by_age_alone() {
+        const NOW: u64 = 1_700_000_000;
+        let tried_refresh = |saved_at: u64, sdk_token: Option<&str>| {
+            let mut config = Config::new("homelink-1", "PSP", "0.1.0", "muse-psp");
+            config.sdk_token = sdk_token.map(String::from);
+            let pairing = Pairing { access_token: "a".into(), refresh_token: "r".into(), saved_at };
+            let security = Security::Tls(secure::settings(Arc::new(NoDate)).unwrap());
+            let opened = Rc::new(Cell::new(0));
+            let mut client = Client::new(config, pairing, security, Counting(opened.clone()), Dated(NOW), Nowhere).unwrap();
+            client.poll(&mut Vec::new(), 0);
+            opened.get() == 1
+        };
+        assert!(!tried_refresh(NOW - 60, Some("mgst_test")), "a fresh token stays, SDK token or not");
+        assert!(tried_refresh(NOW - REFRESH_AGE_S, None), "an old one is rotated");
+        assert!(tried_refresh(0, None), "so is one of unknown age");
     }
 
     #[test]

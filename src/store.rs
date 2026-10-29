@@ -16,8 +16,6 @@ const SDK_TOKEN: &str = "state/sdk_token.txt";
 /// not only the three this app knows.
 pub struct Store {
     fields: Map<String, Value>,
-    /// Whether the next save follows a renewal that carried the SDK token.
-    reporting_sdk_token: bool,
 }
 
 pub struct Saved {
@@ -26,8 +24,6 @@ pub struct Saved {
     pub api_root: Option<String>,
     pub noise_host: Option<String>,
     pub node_id: String,
-    /// The SDK token, while Muse has yet to be told it. Reporting it costs
-    /// a renewal at every start, and Muse needs it once.
     pub sdk_token: Option<String>,
 }
 
@@ -56,14 +52,12 @@ pub fn load() -> Result<Saved, String> {
     let hex: String = mac.chars().filter(|&c| c != ':').take(12).collect();
     // The node id is "homelink-" plus the last six hex digits of the identity.
     let node_id = format!("homelink-{}", &hex[hex.len().saturating_sub(6)..]);
-    let reported = fields.get("sdk_token_reported").and_then(Value::as_bool).unwrap_or(false);
     let sdk_token = files::read(SDK_TOKEN)
         .and_then(|file| String::from_utf8(file).ok())
         .map(|token| String::from(token.trim()))
-        .filter(|token| !reported && !token.is_empty());
+        .filter(|token| !token.is_empty());
     let (api_root, noise_host) = (text("api_url_v2"), text("noise_host"));
-    let store = Store { fields, reporting_sdk_token: sdk_token.is_some() };
-    Ok(Saved { api_root, noise_host, node_id, pairing, sdk_token, store })
+    Ok(Saved { api_root, noise_host, node_id, pairing, sdk_token, store: Store { fields } })
 }
 
 impl Vault for Store {
@@ -71,9 +65,6 @@ impl Vault for Store {
         self.fields.insert("access_token".into(), pairing.access_token.as_str().into());
         self.fields.insert("refresh_token".into(), pairing.refresh_token.as_str().into());
         self.fields.insert("access_token_saved_at".into(), pairing.saved_at.into());
-        if self.reporting_sdk_token {
-            self.fields.insert("sdk_token_reported".into(), true.into());
-        }
         let text = serde_json::to_string(&self.fields).map_err(|_| NotSaved)?;
         if !files::write(PAIRING_NEW, text.as_bytes()) || files::read(PAIRING_NEW).as_deref() != Some(text.as_bytes()) {
             return Err(NotSaved);

@@ -56,11 +56,18 @@ pub(crate) struct Invoke {
     pub params: String,
 }
 
+/// Muse saying whether it is still working.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Status {
+    busy: bool,
+    /// The message this is about, when the event names one.
+    parent: Option<String>,
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum Line {
     Invoke(Invoke),
-    /// Muse saying whether it is still working.
-    Busy(bool),
+    Status(Status),
     Message(Message),
     /// An event this client does not read. It still shows the stream is alive.
     Unread,
@@ -77,6 +84,7 @@ impl Line {
         }
         let nothing = Value::Null;
         let payload = event.get("payload").filter(|payload| payload.is_object()).unwrap_or(&nothing);
+        let parent = text(payload, "reply_to_message_id").or(text(payload, "parent_message_id")).map(String::from);
         let kind = match text(&event, "event") {
             Some("client.invoke") => {
                 return match text(payload, "invoke_id") {
@@ -94,13 +102,14 @@ impl Line {
             Some("agent.status" | "task.status") => {
                 let (activity, status) = (payload.get("activity_code"), payload.get("status"));
                 let named = |value: Option<&Value>, idle: [&str; 2]| !idle.contains(&value.and_then(Value::as_str).unwrap_or(""));
-                return if truthy(activity) {
-                    Line::Busy(named(activity, ["online", "idle"]))
+                let busy = if truthy(activity) {
+                    named(activity, ["online", "idle"])
                 } else if truthy(status) {
-                    Line::Busy(named(status, ["completed", "failed"]))
+                    named(status, ["completed", "failed"])
                 } else {
-                    Line::Unread
+                    return Line::Unread;
                 };
+                return Line::Status(Status { busy, parent });
             }
             Some("message.user") => Kind::User,
             Some("delta.message_start") => Kind::Start,
@@ -117,7 +126,7 @@ impl Line {
         Line::Message(Message {
             kind,
             id: id.into(),
-            parent: text(payload, "reply_to_message_id").or(text(payload, "parent_message_id")).map(String::from),
+            parent,
             text: words.map(String::from),
             ready: payload.get("display_text_ready") != Some(&Value::Bool(false)),
         })
@@ -130,16 +139,24 @@ struct Reply {
     done: bool,
 }
 
+/// An event that arrived before the acknowledgment said which message was
+/// ours.
+enum Held {
+    Message(Message),
+    Status(Status),
+}
+
 /// Muse does not link its reply to the question: a reply names no parent and
 /// its text chunks name themselves. So a message that starts after ours
 /// belongs to the turn, where "after ours" is after the stream echoes our
 /// message, or after the acknowledgment if the echo came first.
 pub(crate) struct Turn {
-    message_id: Option<String>,
+    /// The ids of our message, empty until the acknowledgment names it.
+    ours: Vec<String>,
     ours_seen: bool,
     /// Events race the acknowledgment that names our message, so the first
     /// few wait here for it.
-    waiting: Vec<Message>,
+    waiting: Vec<Held>,
     replies: Vec<Reply>,
     busy: bool,
     /// What Muse heard in a voice note.
@@ -161,7 +178,7 @@ fn push_capped(into: &mut String, words: &str) {
 impl Turn {
     pub(crate) fn new(now_ms: u64) -> Turn {
         Turn {
-            message_id: None,
+            ours: Vec::new(),
             ours_seen: false,
             waiting: Vec::new(),
             replies: Vec::new(),
@@ -173,27 +190,49 @@ impl Turn {
         }
     }
 
-    pub(crate) fn busy(&mut self, busy: bool, now_ms: u64) {
+    /// A shared chat carries statuses for other requests too, so one that
+    /// names a message not of this turn is left alone.
+    pub(crate) fn status(&mut self, status: Status, now_ms: u64) {
         self.last_event_ms = now_ms;
-        self.busy = busy;
+        if status.parent.is_some() && self.ours.is_empty() {
+            self.hold(Held::Status(status));
+        } else {
+            self.apply_status(&status);
+        }
+    }
+
+    fn apply_status(&mut self, status: &Status) {
+        if status.parent.as_deref().is_none_or(|parent| self.linked(parent)) {
+            self.busy = status.busy;
+        }
     }
 
     pub(crate) fn add(&mut self, message: Message, now_ms: u64) {
         self.last_event_ms = now_ms;
-        if self.message_id.is_some() {
+        if self.ours.is_empty() {
+            self.hold(Held::Message(message));
+        } else {
             self.apply(message, true);
-        } else if self.waiting.len() < MOST_WAITING_EVENTS {
-            self.waiting.push(message);
         }
     }
 
-    /// Says which message was ours and replays what arrived before that was
-    /// known.
-    pub(crate) fn acknowledged(&mut self, message_id: &str) {
-        self.message_id = Some(message_id.into());
+    fn hold(&mut self, held: Held) {
+        if self.waiting.len() < MOST_WAITING_EVENTS {
+            self.waiting.push(held);
+        }
+    }
+
+    /// Says which message was ours, and which earlier one of ours it replied
+    /// to if the acknowledgment says, then replays what arrived before that
+    /// was known.
+    pub(crate) fn acknowledged(&mut self, message_id: &str, reply_to: Option<&str>) {
+        self.ours = core::iter::once(message_id).chain(reply_to).map(String::from).collect();
         self.ours_seen = false;
-        for message in core::mem::take(&mut self.waiting) {
-            self.apply(message, false);
+        for held in core::mem::take(&mut self.waiting) {
+            match held {
+                Held::Message(message) => self.apply(message, false),
+                Held::Status(status) => self.apply_status(&status),
+            }
         }
     }
 
@@ -201,12 +240,16 @@ impl Turn {
         self.replies.iter().position(|reply| reply.id == id)
     }
 
+    /// Whether a message id is ours or a reply already on this turn.
+    fn linked(&self, id: &str) -> bool {
+        self.ours.iter().any(|ours| ours == id) || self.find(id).is_some()
+    }
+
     /// `after_ack` is whether the event arrived after the acknowledgment,
     /// when any new parentless message is taken to follow ours.
     fn apply(&mut self, message: Message, after_ack: bool) {
-        let ours = self.message_id.as_deref();
         if message.kind == Kind::User {
-            if Some(message.id.as_str()) == ours {
+            if self.ours.contains(&message.id) {
                 self.ours_seen = true;
                 // The stored message carries the words, which for a voice
                 // note are the transcript.
@@ -222,7 +265,7 @@ impl Turn {
             Some(at) => at,
             None => {
                 let belongs = match message.parent.as_deref() {
-                    Some(parent) => Some(parent) == ours || self.find(parent).is_some(),
+                    Some(parent) => self.linked(parent),
                     None => self.ours_seen || after_ack,
                 };
                 if message.kind == Kind::Append || !belongs || self.replies.len() == MOST_REPLY_MESSAGES {
@@ -303,7 +346,7 @@ mod tests {
     fn feed(turn: &mut Turn, name: &str, payload: &str) {
         match event(name, payload) {
             Line::Message(message) => turn.add(message, 0),
-            Line::Busy(busy) => turn.busy(busy, 0),
+            Line::Status(status) => turn.status(status, 0),
             other => panic!("{name} parsed as {other:?}"),
         }
     }
@@ -334,7 +377,7 @@ mod tests {
         feed(&mut turn, "delta.message_start", r#"{"message_id":"a1","reply_to_message_id":""}"#);
         feed(&mut turn, "delta.text_append", r#"{"message_id":"a1","parent_message_id":"a1","text":"you said: "}"#);
         assert_eq!(shown(&turn), "", "nothing is ours until the acknowledgment names our message");
-        turn.acknowledged("u1");
+        turn.acknowledged("u1", None);
         assert_eq!(shown(&turn), "you said: ");
         assert_eq!(turn.take_heard(), Some("hello"));
         assert_eq!(turn.take_heard(), None);
@@ -350,7 +393,7 @@ mod tests {
     #[test]
     fn a_second_message_joins_with_a_blank_line_and_final_text_replaces_chunks() {
         let mut turn = Turn::new(0);
-        turn.acknowledged("u1");
+        turn.acknowledged("u1", None);
         feed(&mut turn, "delta.message_start", r#"{"message_id":"a1"}"#);
         feed(&mut turn, "delta.text_append", r#"{"message_id":"a1","text":"dra"}"#);
         feed(&mut turn, "message.assistant", r#"{"message_id":"a1","display_text":"final","display_text_ready":false}"#);
@@ -368,9 +411,39 @@ mod tests {
     }
 
     #[test]
+    fn a_status_about_another_request_leaves_the_turn_alone() {
+        let mut turn = Turn::new(0);
+        feed(&mut turn, "task.status", r#"{"status":"running","reply_to_message_id":"u1"}"#);
+        feed(&mut turn, "task.status", r#"{"status":"completed","parent_message_id":"another-request"}"#);
+        turn.acknowledged("u1", None);
+        feed(&mut turn, "delta.message_done", r#"{"message_id":"a1","content":"answer"}"#);
+        assert!(!turn.whole(), "our status waited for the acknowledgment, the other request's did not count");
+        feed(&mut turn, "agent.status", r#"{"activity_code":"online","parent_message_id":"another-request"}"#);
+        assert!(!turn.whole(), "another request finishing does not end this turn");
+        feed(&mut turn, "task.status", r#"{"status":"completed","reply_to_message_id":"a1"}"#);
+        assert!(turn.whole(), "a status about our reply counts");
+        feed(&mut turn, "agent.status", r#"{"activity_code":"working","reply_to_message_id":"another-request"}"#);
+        assert!(turn.whole(), "another request starting does not keep this turn busy");
+        feed(&mut turn, "agent.status", r#"{"activity_code":"working"}"#);
+        assert!(!turn.whole(), "a status naming no request still counts");
+        feed(&mut turn, "task.status", r#"{"status":"completed","reply_to_message_id":"u1"}"#);
+        assert!(turn.whole());
+    }
+
+    #[test]
+    fn the_acknowledgment_can_name_an_earlier_message_of_ours() {
+        let mut turn = Turn::new(0);
+        turn.acknowledged("u2", Some("u1"));
+        feed(&mut turn, "delta.message_done", r#"{"message_id":"a1","reply_to_message_id":"u1","content":"answer"}"#);
+        assert_eq!(shown(&turn), "answer");
+        feed(&mut turn, "task.status", r#"{"status":"running","parent_message_id":"u1"}"#);
+        assert!(!turn.whole());
+    }
+
+    #[test]
     fn a_runaway_reply_is_cut_on_a_character() {
         let mut turn = Turn::new(0);
-        turn.acknowledged("u1");
+        turn.acknowledged("u1", None);
         feed(&mut turn, "delta.message_start", r#"{"message_id":"a1"}"#);
         let chunk = format!(r#"{{"message_id":"a1","text":"{}"}}"#, "é".repeat(20_000));
         feed(&mut turn, "delta.text_append", &chunk);
