@@ -188,6 +188,7 @@ impl App for Avatar {
                     TURN.store(NO_QUESTION, Ordering::Relaxed);
                 }
             }
+            Event::Call(state) => crate::say!("call: {:?}", state),
         }
     }
 

@@ -6,13 +6,15 @@
 //! from one thread, and everything the client has to say comes back through
 //! [`App`] during that call.
 
+use crate::call::{Call, CallAudio, CallState};
 use crate::channel::{Fault, Security};
 use crate::connection::Hello;
+use crate::noise::Handshake;
 use crate::pace::{Backoff, Door, REFUSED_WAIT_MS};
 use crate::session::{log, Ask, End, Session, LARGEST_WAV};
 use crate::url::{encode_component, Endpoint};
 use crate::{api, Clock, Net};
-use alloc::{format, string::String, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::fmt;
 use serde_json::{json, Value};
 use zeroize::Zeroize;
@@ -162,6 +164,9 @@ pub enum Event<'a> {
     /// The question failed. `text` is whatever part of a reply had arrived.
     /// Ends the question.
     Failed { text: &'a str, why: &'a str },
+    /// The call moved on. Every call ends with exactly one
+    /// `CallState::Ended`.
+    Call(CallState),
 }
 
 /// The app's side of the client. Both are called only during
@@ -179,7 +184,8 @@ pub enum Refused {
     TooBig,
     /// Not [`State::Connected`].
     Offline,
-    /// The last question has not had its `Done` or `Failed` yet.
+    /// The last question has not had its `Done` or `Failed` yet, or a call
+    /// has not had its `CallState::Ended`.
     Busy,
 }
 
@@ -199,7 +205,8 @@ enum Phase<W: crate::Wire> {
     Start,
     Fetch,
     Open { vm: api::Vm, knocks_left: u32 },
-    Serving(Session<W>),
+    /// The VM is kept so a call can dial the same one with the same bearer.
+    Serving(Session<W>, api::Vm),
     /// Waiting, and then `knock` again if set, else a new round.
     Rest { until_ms: u64, knock: Option<(api::Vm, u32)> },
     Unpaired,
@@ -241,7 +248,10 @@ pub struct Client<N: Net, C: Clock, V: Vault> {
     backoff: Backoff,
     door: Door,
     hello: Option<Hello>,
+    /// Made ahead for the next call, since it is the slow part of a dial.
+    call_hello: Option<Hello>,
     ask: Option<Ask>,
+    call: Option<Call<N::Wire>>,
 }
 
 impl<N: Net, C: Clock, V: Vault> Client<N, C, V> {
@@ -296,7 +306,9 @@ impl<N: Net, C: Clock, V: Vault> Client<N, C, V> {
             backoff: Backoff::default(),
             door: Door::default(),
             hello: None,
+            call_hello: None,
             ask: None,
+            call: None,
         })
     }
 
@@ -306,7 +318,7 @@ impl<N: Net, C: Clock, V: Vault> Client<N, C, V> {
 
     /// Whether a question is waiting for its `Done` or `Failed`.
     pub fn asking(&self) -> bool {
-        self.ask.is_some() || matches!(&self.phase, Phase::Serving(session) if session.asking())
+        self.ask.is_some() || matches!(&self.phase, Phase::Serving(session, _) if session.asking())
     }
 
     /// Asks Muse a question. The reply arrives as [`Event`]s during later
@@ -336,18 +348,52 @@ impl<N: Net, C: Clock, V: Vault> Client<N, C, V> {
         if self.state != State::Connected {
             return Err(Refused::Offline);
         }
-        if self.asking() {
+        if self.asking() || self.call.is_some() {
             return Err(Refused::Busy);
         }
         self.ask = Some(ask);
         Ok(())
     }
 
+    /// Starts a voice call with Muse, on a second connection to the
+    /// session's VM. It dials on the next poll, which blocks for as long as
+    /// connecting takes. Its progress comes as `Event::Call`, ending with
+    /// exactly one `CallState::Ended`, after which `audio` is dropped.
+    pub fn call(&mut self, audio: Box<dyn CallAudio>) -> Result<(), Refused> {
+        if self.state != State::Connected {
+            return Err(Refused::Offline);
+        }
+        let Phase::Serving(_, vm) = &self.phase else { return Err(Refused::Offline) };
+        if self.asking() || self.call.is_some() {
+            return Err(Refused::Busy);
+        }
+        let mut path = String::from("/v1/noise?vm_id=");
+        encode_component(&vm.target, &mut path);
+        path.push_str("&app_id=hatch-web");
+        let call = Call::new(self.noise.at(&path), vm.bearer.clone(), &self.node_id, audio, self.call_hello.take()).map_err(|_| Refused::Offline)?;
+        self.call = Some(call);
+        Ok(())
+    }
+
+    /// Ends the call the way Muse expects: end-call, its answer, then the
+    /// media closes. Does nothing without a call, and is safe to repeat.
+    pub fn hang_up(&mut self) {
+        if let Some(call) = self.call.as_mut() {
+            call.hang_up();
+        }
+    }
+
     /// Does the next piece of work. While connected that is reading for up
     /// to `wait_ms`, so a small value keeps the caller's loop lively. While
     /// connecting it is one whole step, such as a TLS handshake and an API
     /// call, which takes as long as the network does: seconds on a PSP.
+    /// While a call is up it steps the call, and the link session only reads
+    /// what has already arrived. No new session is opened until the call is
+    /// over.
     pub fn poll(&mut self, app: &mut impl App, wait_ms: u32) -> Poll {
+        if self.call.is_some() {
+            return self.poll_call(app, wait_ms);
+        }
         let now = self.clock.millis();
         let (phase, poll) = match core::mem::replace(&mut self.phase, Phase::Unpaired) {
             Phase::Unpaired => (Phase::Unpaired, Poll::Unpaired),
@@ -359,19 +405,45 @@ impl<N: Net, C: Clock, V: Vault> Client<N, C, V> {
             Phase::Start => self.start(app, now),
             Phase::Fetch => self.fetch(app, now),
             Phase::Open { vm, knocks_left } => self.open(app, now, vm, knocks_left),
-            Phase::Serving(mut session) => {
-                let stepped = session.step(&self.clock, app, &mut self.ask, wait_ms);
-                if session.registered_at_ms.is_some() {
-                    self.set_state(app, State::Connected);
-                }
-                match stepped {
-                    Ok(()) => (Phase::Serving(session), Poll::Active),
-                    Err(end) => self.ended(app, session, end),
-                }
-            }
+            Phase::Serving(session, vm) => self.serve(app, session, vm, wait_ms),
         };
         self.phase = phase;
+        if self.state == State::Connected && self.call_hello.is_none() && !self.asking() {
+            self.call_hello = Handshake::begin().ok();
+        }
         poll
+    }
+
+    /// A call is realtime and the link can wait, so the call goes first.
+    /// Fetch and Open block for seconds, so while a call is up only a
+    /// session that is already serving gets a step, and one that does not
+    /// wait.
+    fn poll_call(&mut self, app: &mut impl App, wait_ms: u32) -> Poll {
+        if let Some(call) = self.call.as_mut() {
+            if matches!(self.phase, Phase::Unpaired) {
+                call.hang_up();
+            }
+            call.step(&mut self.net, &self.clock, &self.security, app, wait_ms);
+            if call.is_over() {
+                self.call = None;
+            }
+        }
+        self.phase = match core::mem::replace(&mut self.phase, Phase::Unpaired) {
+            Phase::Serving(session, vm) => self.serve(app, session, vm, 0).0,
+            phase => phase,
+        };
+        Poll::Active
+    }
+
+    fn serve(&mut self, app: &mut impl App, mut session: Session<N::Wire>, vm: api::Vm, wait_ms: u32) -> (Phase<N::Wire>, Poll) {
+        let stepped = session.step(&self.clock, app, &mut self.ask, wait_ms);
+        if session.registered_at_ms.is_some() {
+            self.set_state(app, State::Connected);
+        }
+        match stepped {
+            Ok(()) => (Phase::Serving(session, vm), Poll::Active),
+            Err(end) => self.ended(app, session, end),
+        }
     }
 
     fn set_state(&mut self, app: &mut impl App, state: State) {
@@ -536,7 +608,7 @@ impl<N: Net, C: Clock, V: Vault> Client<N, C, V> {
             &mut self.hello,
         );
         match opened {
-            Ok(session) => (Phase::Serving(session), Poll::Active),
+            Ok(session) => (Phase::Serving(session, vm), Poll::Active),
             // A VM nothing has reached for a while is not behind its front
             // door yet, and the door says 403 until it is. Asked again every
             // half second it opens within seconds. Asked once a minute it

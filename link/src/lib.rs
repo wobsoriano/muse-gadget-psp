@@ -15,7 +15,6 @@ pub mod speech;
 pub mod wav;
 
 mod api;
-#[allow(dead_code)]
 mod call;
 mod channel;
 mod client;
@@ -29,6 +28,7 @@ mod turn;
 mod url;
 mod ws;
 
+pub use call::{CallAudio, CallState, Ended, Heard, CALL_RATE};
 pub use channel::Security;
 pub use client::{App, BadConfig, Client, Config, Event, NotSaved, Pairing, Poll, Refused, State, Trouble, Vault};
 

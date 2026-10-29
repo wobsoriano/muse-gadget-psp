@@ -214,7 +214,6 @@ pub(crate) enum Part<'a> {
     Request { path: &'a str, headers: &'a [(&'a str, &'a str)], body: &'a [u8], end: bool },
     Body { data: &'a [u8], end: bool },
     /// Abandons the stream both ways, as cancelled.
-    #[allow(dead_code)]
     Reset { reason: &'a str },
 }
 

@@ -171,6 +171,7 @@ impl App for Driver {
                 self.record(json!(["ask_failed", why, text]));
                 self.ended = Some(false);
             }
+            Event::Call(state) => self.record(json!(["call", format!("{state:?}")])),
         }
     }
 
