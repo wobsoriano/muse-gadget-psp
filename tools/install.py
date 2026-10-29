@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Copy Muse to the PSP's Memory Stick.
 
-    tools/install.py [--volume /Volumes/NAME] [--no-eject]
+    tools/install.py [--volume /Volumes/NAME] [--calls] [--no-eject]
 
 Put the PSP in USB Connection mode first. This copies the built app and the
 avatar to PSP/GAME/Muse on the stick and ejects it. Run it again after every
@@ -11,6 +11,10 @@ This copies the pairing only once. From then on the PSP renews its own tokens
 and saves them on the stick, so the copy on the stick is the live one and the
 copy in state/ here goes stale. Overwriting the stick's pairing with a stale
 one would unpair the PSP, so this leaves an existing pairing alone.
+
+With --calls the app starts in call mode, where START calls Muse. The PSP
+keeps the mode in state/mode.txt, so a later install without --calls leaves
+it as it is.
 """
 import argparse
 import pathlib
@@ -46,6 +50,8 @@ def main():
     parser.add_argument("--volume", help="the Memory Stick (default: the one mounted)")
     parser.add_argument("--sdk-token-file", help="your Muse SDK token (default: .sdk_token)")
     parser.add_argument("--openai-key-file", help="an OpenAI key for the voice (default: .openai_key)")
+    parser.add_argument("--calls", action="store_true",
+                        help="start in call mode. SELECT on the PSP, or deleting state/mode.txt, goes back to voice notes")
     parser.add_argument("--no-eject", action="store_true", help="leave the stick mounted")
     args = parser.parse_args()
 
@@ -78,6 +84,9 @@ def main():
     if key:
         (state / "openai_key.txt").write_text(key)
     print("voice: %s" % ("on" if (state / "openai_key.txt").exists() else "off, replies will not be spoken"))
+    if args.calls:
+        (state / "mode.txt").write_text("call\n")
+    print("mode: %s" % ("calls" if (state / "mode.txt").exists() else "voice notes"))
 
     # macOS leaves "._" companions on FAT sticks, and the PSP lists them as corrupted data.
     for junk in target.rglob("._*"):

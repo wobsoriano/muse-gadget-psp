@@ -35,7 +35,8 @@ written in Rust, and the Muse client follows the protocol of the
   SDK's Linux client will do. See [Pair it with Muse](#4-pair-it-with-muse)
   for why.
 - **An OpenAI API key, for the voice.** Without one the PSP still hears you
-  and Muse still answers, but the PSP stays silent.
+  and Muse still answers, but the PSP stays silent. Calls use Muse's own
+  voice and do not need one.
 
 ## Install
 
@@ -155,6 +156,37 @@ shows what it is doing.
 
 Name the device when you ask, for example "say hello on my PSP".
 
+### Talk to Muse on a call (experimental)
+
+On a call you talk with Muse back and forth, and it answers in its own
+voice. Press **SELECT** while no call or question is in flight to switch to
+call mode, or install with `tools/install.py --calls`. The PSP keeps the mode
+in `state/mode.txt` on the Memory Stick. Press SELECT again, or delete the
+file, to go back to voice notes.
+
+- Press **START** to call Muse, and again to hang up.
+- Hold **R** to talk, and release when you are done. Muse answers out loud
+  and the call stays open. Hold R while Muse is talking to interrupt it.
+- Say goodbye and Muse can hang up by itself, after its last words.
+
+A second row under the first shows the call. The avatar listens, thinks and
+speaks as it does for a voice note.
+
+| You see | It means |
+|---|---|
+| A grey light and "START to call" | Call mode, with no call. Press START. |
+| A blinking amber light and "calling" | Reaching Muse. This takes a few seconds. |
+| A green light and "on call 1:23" | Muse is on the line. Hold R to talk. |
+| An amber light and "on call 1:23" | The upload fell behind, and the app dropped some of your audio |
+| An amber light and "hanging up" | The call is ending |
+| A grey light and "call ended" | You or Muse hung up, or the call reached a limit |
+| A red light and "no answer", "call refused", "call lost" or "call failed" | The call did not start, or it broke |
+
+Calls use Muse's own voice, so they need no OpenAI key. A call ends after 45
+seconds in which nobody talks and Muse works on nothing, and after 15
+minutes in any case. During a call Muse cannot use `psp.say`, and it is told
+why.
+
 ## How it works
 
 ```
@@ -173,10 +205,14 @@ tests/    the client against a fake Muse
   out its loudness, and sends it to Muse as a WAV voice note. Muse answers in
   text. The app sends that text to OpenAI and plays the audio while it is
   still arriving.
-- **Five threads share one processor.** They are the screen, the microphone,
-  the connection, the speech download and the speaker. They pass work to
-  each other through atomics, because a lock between threads of different
-  priority can hang a PSP.
+- **A call.** The app opens a second encrypted connection to the same Muse
+  and sends 40 ms frames of 24 kHz audio both ways. The microphone's own
+  clock paces the upload. Muse's voice plays through the PSP's hardware
+  24 kHz channel.
+- **Six threads share one processor.** They are the screen, the microphone,
+  the connection, the speech download, the speaker and the call's speaker.
+  They pass work to each other through atomics, because a lock between
+  threads of different priority can hang a PSP.
 - **Things the PSP made hard.** It has no hardware random source, so room
   noise from the microphone feeds the encryption. Its own name lookup could
   hang forever, so the app does its own DNS. Its working folder belongs to
@@ -194,6 +230,8 @@ uv run --with pytest --with cryptography --with websockets pytest tests/test_rus
 The first runs the pure parts, including a Noise handshake checked byte for
 byte against the SDK's Python. The second drives the client against a fake
 Muse built on the SDK's own code, which is what the clone in step 2 is for.
+Four of its tests make a call: one Muse ends with a goodbye, one you
+interrupt, one the VM refuses, and one whose session dies partway.
 
 Two programs in `host/` run the PSP's network code against the real services
 from a computer. `host-check` makes one HTTPS request, and `speech` speaks a
@@ -213,16 +251,21 @@ its signal strength, which is the first thing to check.
   and the OpenAI key. Anyone holding the stick can read them.
 - **The random numbers are weaker than a modern device's.** Microphone noise
   is the best source the PSP offers.
-- **No voice without OpenAI.** There is no offline voice and no text on
-  screen. When the PSP cannot speak an answer, all you get is the hearts.
+- **No voice without OpenAI, except on a call.** There is no offline voice
+  and no text on screen. When the PSP cannot speak an answer to a voice
+  note, all you get is the hearts.
 - **It needs a strong Wi-Fi signal.** The PSP's radio is weak. Beside my
   router a question reaches Muse in three to six seconds. Two rooms away
   the same question stalled for a quarter of a minute or never arrived, and
   joining Wi-Fi took 25 seconds where it had taken 4. If a question gets
   lost on the way, the app asks it again once by itself.
 - **Long answers get cut short.** The PSP speaks about the first 420
-  characters.
-- **Muse sends text, not audio.** OpenAI makes the voice.
+  characters of an answer to a voice note.
+- **For a voice note Muse sends text, not audio.** OpenAI makes the voice.
+- **Calls are an experiment.** A call needs about 64 KB/s each way without a
+  break, which is at the edge of what this PSP's radio managed beside the
+  router. When the upload falls behind, the app drops some of your audio and
+  the light turns amber. A weak signal ends the call, not the app.
 
 ## License
 
