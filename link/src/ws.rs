@@ -25,6 +25,48 @@ pub(crate) fn base64(data: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// Reads standard base64 with its padding, as `base64` writes it, onto the
+/// end of `out`. `None`, with `out` left as it was, for any other byte,
+/// padding anywhere but the end, or more than `most` bytes.
+#[allow(dead_code)]
+pub(crate) fn unbase64(text: &[u8], most: usize, out: &mut Vec<u8>) -> Option<()> {
+    if text.len() % 4 != 0 {
+        return None;
+    }
+    let padding = text.iter().rev().take(2).take_while(|&&byte| byte == b'=').count();
+    if text.len() / 4 * 3 - padding > most {
+        return None;
+    }
+    let start = out.len();
+    let groups = text.len() / 4;
+    let read = (|| {
+        for (index, group) in text.chunks(4).enumerate() {
+            let pad = if index + 1 == groups { padding } else { 0 };
+            let mut bits = 0u32;
+            for &byte in &group[..4 - pad] {
+                bits = bits << 6 | u32::from(sextet(byte)?);
+            }
+            out.extend_from_slice(&(bits << (6 * pad)).to_be_bytes()[1..4 - pad]);
+        }
+        Some(())
+    })();
+    if read.is_none() {
+        out.truncate(start);
+    }
+    read
+}
+
+fn sextet(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
 fn base64_text(data: &[u8]) -> String {
     let mut out = Vec::with_capacity(data.len().div_ceil(3) * 4);
     base64(data, &mut out);
@@ -215,6 +257,31 @@ mod tests {
         for (plain, coded) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE=")] {
             assert_eq!(base64_text(plain.as_bytes()), coded);
         }
+    }
+
+    #[test]
+    fn unbase64_reads_back_what_base64_writes() {
+        for len in 0..300 {
+            let data: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let mut coded = Vec::new();
+            base64(&data, &mut coded);
+            let mut out = vec![9];
+            assert_eq!(unbase64(&coded, len, &mut out), Some(()), "{len} bytes");
+            assert_eq!((out[0], &out[1..]), (9, &data[..]), "{len} bytes, after what was there");
+        }
+    }
+
+    #[test]
+    fn unbase64_takes_only_padded_standard_base64_within_its_limit() {
+        for bad in ["Zg=", "Zg", "Z===", "====", "=Zg=", "Zg==Zg==", "Zg=A", "Zm9\n", "Zm-v", "Zm_v", " Zm9", "Zm9v\r\nZg=="] {
+            let mut out = b"kept".to_vec();
+            assert_eq!(unbase64(bad.as_bytes(), 100, &mut out), None, "{bad:?}");
+            assert_eq!(out, b"kept", "{bad:?} leaves the output as it was");
+        }
+        let mut out = Vec::new();
+        assert_eq!(unbase64(b"Zm9vYg==", 3, &mut out), None, "four bytes is over three");
+        assert_eq!(unbase64(b"Zm9vYg==", 4, &mut out), Some(()));
+        assert_eq!(out, b"foob");
     }
 
     #[test]

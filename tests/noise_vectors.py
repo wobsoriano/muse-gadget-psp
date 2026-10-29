@@ -60,8 +60,9 @@ started = transport._send_application_request(
 sealed_request = started.frames
 stream_id = started.stream_id
 sealed_body = transport.encrypt_body_chunk(stream_id, b"tail", end_body=True)
-assert stream_id == 1 and len(sealed_request) == len(sealed_body) == 1
-for sealed in (sealed_request, sealed_body):
+sealed_reset = transport.encrypt_reset(stream_id, reason="call ended")
+assert stream_id == 1 and len(sealed_request) == len(sealed_body) == len(sealed_reset) == 1
+for sealed in (sealed_request, sealed_body, sealed_reset):
     decode_request_envelope(noise_frames.NoiseFrameDecoder().decode(server_recv.decrypt_with_ad(b"", sealed[0])))
 
 
@@ -89,6 +90,7 @@ out += const("INITIATOR_EPHEMERAL", PRIVATE_KEYS[0]) + const("INITIATOR_STATIC",
 out += const("MESSAGE_1", msg1) + const("MESSAGE_2", msg2) + const("MESSAGE_3", msg3)
 out += "pub const CHUNK_ID: i64 = 0x%X;\n" % CHUNK_ID
 out += const("SEALED_REQUEST", sealed_request[0]) + const("SEALED_BODY", sealed_body[0])
+out += const("SEALED_RESET", sealed_reset[0])
 for name in ("RESPONSE", "BODY", "RESET"):
     out += const("FROM_SERVER_" + name, server_frames[name][0])
 out += "pub const FROM_SERVER_BIG: [&str; 3] = [\n%s];\n" % "".join(

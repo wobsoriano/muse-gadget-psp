@@ -27,6 +27,8 @@ const MOST_CHUNKS: usize = 256;
 const MOST_ASSEMBLIES: usize = 4;
 const LARGEST_ASSEMBLY: usize = 2 * 1024 * 1024;
 const ASSEMBLY_LIFE_MS: u64 = 60_000;
+/// The reset code both SDK clients send.
+const CANCELLED: u64 = 1;
 
 /// The session can no longer be trusted or continued.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -211,6 +213,9 @@ pub(crate) enum Part<'a> {
     /// Opens the stream. Every request this client makes is a POST.
     Request { path: &'a str, headers: &'a [(&'a str, &'a str)], body: &'a [u8], end: bool },
     Body { data: &'a [u8], end: bool },
+    /// Abandons the stream both ways, as cancelled.
+    #[allow(dead_code)]
+    Reset { reason: &'a str },
 }
 
 pub(crate) struct Sender {
@@ -265,6 +270,13 @@ impl Sender {
                     proto::put_uint(message, 2, 1);
                 }
                 4
+            }
+            Part::Reset { reason } => {
+                proto::put_uint(message, 1, CANCELLED);
+                if !reason.is_empty() {
+                    proto::put_bytes(message, 2, reason.as_bytes());
+                }
+                5
             }
         };
         // A ServiceRequest: field 2 wraps the stream's number and the frame.
@@ -509,6 +521,7 @@ mod tests {
         let request = Part::Request { path: "/chat/stream", headers: &headers, body: br#"{"message":"hi"}"#, end: false };
         assert_eq!(sealed(&mut sender, stream, request), hex(known::SEALED_REQUEST));
         assert_eq!(sealed(&mut sender, stream, Part::Body { data: b"tail", end: true }), hex(known::SEALED_BODY));
+        assert_eq!(sealed(&mut sender, stream, Part::Reset { reason: "call ended" }), hex(known::SEALED_RESET));
     }
 
     #[test]
