@@ -28,7 +28,6 @@ pub(crate) fn base64(data: &[u8], out: &mut Vec<u8>) {
 /// Reads standard base64 with its padding, as `base64` writes it, onto the
 /// end of `out`. `None`, with `out` left as it was, for any other byte,
 /// padding anywhere but the end, or more than `most` bytes.
-#[allow(dead_code)]
 pub(crate) fn unbase64(text: &[u8], most: usize, out: &mut Vec<u8>) -> Option<()> {
     if text.len() % 4 != 0 {
         return None;

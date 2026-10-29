@@ -15,6 +15,8 @@ pub mod speech;
 pub mod wav;
 
 mod api;
+#[allow(dead_code)]
+mod call;
 mod channel;
 mod client;
 mod connection;
