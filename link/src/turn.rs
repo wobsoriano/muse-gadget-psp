@@ -56,11 +56,9 @@ pub(crate) struct Invoke {
     pub params: String,
 }
 
-/// Muse saying whether it is still working.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Status {
     busy: bool,
-    /// The message this is about, when the event names one.
     parent: Option<String>,
 }
 
@@ -139,8 +137,6 @@ struct Reply {
     done: bool,
 }
 
-/// An event that arrived before the acknowledgment said which message was
-/// ours.
 enum Held {
     Message(Message),
     Status(Status),
@@ -151,7 +147,6 @@ enum Held {
 /// belongs to the turn, where "after ours" is after the stream echoes our
 /// message, or after the acknowledgment if the echo came first.
 pub(crate) struct Turn {
-    /// The ids of our message, empty until the acknowledgment names it.
     ours: Vec<String>,
     ours_seen: bool,
     /// Events race the acknowledgment that names our message, so the first
@@ -222,9 +217,6 @@ impl Turn {
         }
     }
 
-    /// Says which message was ours, and which earlier one of ours it replied
-    /// to if the acknowledgment says, then replays what arrived before that
-    /// was known.
     pub(crate) fn acknowledged(&mut self, message_id: &str, reply_to: Option<&str>) {
         self.ours = core::iter::once(message_id).chain(reply_to).map(String::from).collect();
         self.ours_seen = false;
@@ -240,7 +232,6 @@ impl Turn {
         self.replies.iter().position(|reply| reply.id == id)
     }
 
-    /// Whether a message id is ours or a reply already on this turn.
     fn linked(&self, id: &str) -> bool {
         self.ours.iter().any(|ours| ours == id) || self.find(id).is_some()
     }
