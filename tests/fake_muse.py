@@ -21,6 +21,14 @@ with the transcript when the session ends.
     --tls DIR        serve HTTPS and WSS as "localhost", with a certificate made
                      on the spot. Its authority is written to DIR/ca.der, and
                      an authority that signed nothing to DIR/stranger.der
+    --call           the device calls on a second connection, with app_id=hatch-web
+                     in its address. The call is played through: readiness, the
+                     device's talk, a reply held for its turn, then Muse's goodbye.
+                     The link session waits for the call in place of chats
+    --call-barge     the device presses again while the first reply plays, and
+                     hangs up after the second
+    --call-reject    the call's media request is answered 403
+    --call-dead      the call's session dies just after readiness
 """
 
 import argparse
@@ -31,7 +39,9 @@ import json
 import os
 import datetime
 import pathlib
+import re
 import ssl
+import struct
 import sys
 import time
 
@@ -42,6 +52,7 @@ if not (SDK / "linux" / "src" / "musegadget").is_dir():
 sys.path.insert(0, str(SDK / "linux" / "src"))
 
 from websockets.asyncio.server import serve  # noqa: E402
+from websockets.exceptions import ConnectionClosed  # noqa: E402
 
 from musegadget.link_client import MessageDecoder, encode_message  # noqa: E402
 from musegadget.noise import (  # noqa: E402
@@ -57,14 +68,24 @@ parser.add_argument("--forbid", type=int, default=0)
 parser.add_argument("--chat-invoke", action="store_true")
 parser.add_argument("--reject-register", action="store_true")
 parser.add_argument("--tls")
+parser.add_argument("--call", action="store_true")
+parser.add_argument("--call-barge", action="store_true")
+parser.add_argument("--call-reject", action="store_true")
+parser.add_argument("--call-dead", action="store_true")
 args = parser.parse_args()
 
 BIG_TEXT = "badge " * 20000  # 120 KB, so the invoke spans two Noise chunks
 EXPECTED_ASKS = 3 if args.voice else 2
 DEAD_SECONDS = 70
+CALL = args.call or args.call_barge or args.call_reject or args.call_dead
+TENTH = 2400  # samples in 0.1 s at 24 kHz
+FIRST_REPLY, SECOND_REPLY = 1111, 2222
 transcript = {"api": [], "vm": [], "dead_vm": [], "chats": [], "subscribes": 0,
-              "connections": 0, "voice": None, "knocks": [], "chat_invoke_result": None}
+              "connections": 0, "voice": None, "knocks": [], "chat_invoke_result": None, "call": None,
+              "invoke_during_call": None}
 done = asyncio.Event()
+call_open = asyncio.Event()
+call_done = asyncio.Event()
 
 
 async def api_handler(reader, writer):
@@ -116,14 +137,18 @@ class Vm:
         responder.read_message3(await self.ws.recv())
         self.send_cipher, self.recv_cipher = responder.split()
 
-    async def next_frame(self):
-        """The next frame the script cares about; side requests are answered here."""
+    async def raw_frame(self):
+        """The next whole frame the device sent."""
         while True:
             plain = self.recv_cipher.decrypt_with_ad(b"", await self.ws.recv())
             assembled = self.decoder.decode(plain)
-            if assembled is None:
-                continue
-            frame = decode_request_envelope(assembled)
+            if assembled is not None:
+                return decode_request_envelope(assembled)
+
+    async def next_frame(self):
+        """The next frame the script cares about; side requests are answered here."""
+        while True:
+            frame = await self.raw_frame()
             if frame.kind == "request" and frame.value.path != "/link-control":
                 if frame.value.end_body:
                     await self.answer(frame.stream_id, frame.value, frame.value.body, 0)
@@ -240,7 +265,243 @@ class Vm:
             await asyncio.sleep(0.3)
 
 
+def ndjson(*events):
+    return b"".join(json.dumps(event, separators=(",", ":")).encode() + b"\n" for event in events)
+
+
+def voice(sample, samples, response_id=None):
+    """Muse's voice as the VM sends it, every sample the same."""
+    event = {"type": "continuous_audio_video.delta", "audio_delta": {
+        "audio_frames": base64.b64encode(struct.pack("<h", sample) * samples).decode(),
+        "format": {"type": "", "rate": 24000}, "num_channels": 1, "num_frames": samples}}
+    if response_id:
+        event["response_id"] = response_id
+    return event
+
+
+KEEPALIVE = voice(0, 960)
+
+
+def speech(what, item):
+    return {"type": "input_audio_buffer.speech_" + what, "item_id": item}
+
+
+def response(what, response_id, status=None):
+    return {"type": "response." + what, "response": {"id": response_id, **({"status": status} if status else {})}}
+
+
+def turn(submission, item):
+    return {"type": "hatch.voice.turn_started", "submission_message_id": submission, "item_id": item}
+
+
+def settled(submission):
+    return {"type": "hatch.voice.turn_settled", "response_message_id": submission}
+
+
+class Call:
+    """The VM's side of one realtime voice call, and a record of what the device did."""
+
+    def __init__(self, vm):
+        self.vm = vm
+        self.media = None
+        self.end_call = None
+        self.ready = False
+        self.goodbye_at = None
+        self.log = {
+            "path": vm.ws.request.path, "authorization": vm.ws.request.headers.get("Authorization"),
+            "order": [], "media_request": None, "admission": None, "offer": None,
+            # One letter per append: z for exact zeros, L for anything else.
+            "appends": "", "early_appends": 0, "bad_appends": 0, "after_end_call": 0, "commits": 0,
+            "cancels": [], "end_calls": [], "half_close": None, "resets": [], "unexpected": [],
+            "sent": {"p1": 0, "p2": 0, "stale": 0}, "error": None,
+            # Seconds from the first append to the last, and from Muse's goodbye to end-call.
+            "appending": None, "goodbye_to_end_call": None,
+        }
+        self.first_append_at = None
+
+    def mark(self, milestone):
+        self.log["order"].append(milestone)
+
+    async def read(self):
+        """Records every frame the device sends, until it closes."""
+        try:
+            while True:
+                frame = await self.vm.raw_frame()
+                if frame.kind == "request":
+                    self.on_request(frame)
+                elif frame.kind == "body_chunk" and frame.stream_id == self.media:
+                    # Each record is its own body chunk.
+                    for line in frame.value.data.splitlines():
+                        self.on_record(json.loads(line))
+                    if frame.value.end_body:
+                        self.log["half_close"] = len(frame.value.data)
+                        self.mark("half_close")
+                elif frame.kind == "reset":
+                    self.log["resets"].append(frame.stream_id)
+                else:
+                    self.log["unexpected"].append("%s on stream %d" % (frame.kind, frame.stream_id))
+        except ConnectionClosed:
+            pass
+        except Exception as error:
+            self.log["error"] = "reading: %r" % error
+
+    def on_request(self, frame):
+        request = frame.value
+        headers = {header.key: header.value for header in request.headers}
+        if request.path.startswith("/voice/realtime?") and self.media is None:
+            self.media = frame.stream_id
+            self.log["media_request"] = {"path": request.path, "headers": headers,
+                                         "body": request.body.decode(), "end_body": request.end_body}
+            self.mark("media_request")
+        elif request.path == "/voice/end-call":
+            self.end_call = frame.stream_id
+            if self.goodbye_at is not None:
+                self.log["goodbye_to_end_call"] = time.monotonic() - self.goodbye_at
+            self.log["end_calls"].append({"headers": headers, "body": json.loads(request.body),
+                                          "end_body": request.end_body})
+            self.mark("end_call")
+        else:
+            self.log["unexpected"].append("request " + request.path)
+
+    def on_record(self, record):
+        kind = record.get("type")
+        if kind == "input_audio_buffer.append":
+            pcm = base64.b64decode(record["audio"], validate=True)
+            self.log["bad_appends"] += len(pcm) != 1920
+            self.log["early_appends"] += not self.ready
+            self.log["after_end_call"] += self.end_call is not None
+            if not self.log["appends"]:
+                self.mark("append")
+                self.first_append_at = time.monotonic()
+            self.log["appends"] += "L" if any(pcm) else "z"
+            self.log["appending"] = time.monotonic() - self.first_append_at
+        elif kind == "input_audio_buffer.commit":
+            self.log["commits"] += 1
+        elif kind == "response.cancel":
+            self.log["cancels"].append(record.get("response_id"))
+            self.mark("cancel")
+        elif kind == "hatch.voice.call.start" and self.log["admission"] is None:
+            self.log["admission"] = record
+            self.mark("admission")
+        elif kind == "hatch.voice.capability.offer" and self.log["offer"] is None:
+            self.log["offer"] = record
+            self.mark("offer")
+        else:
+            self.log["unexpected"].append(record)
+
+    async def until(self, ready, what, seconds=20):
+        for _ in range(int(seconds / 0.05)):
+            if ready():
+                return
+            await asyncio.sleep(0.05)
+        raise TimeoutError("no " + what)
+
+    def talked(self, times):
+        """The device has talked this many times, and gone quiet after the last."""
+        return len(re.findall(r"L+z{5}", self.log["appends"])) >= times
+
+    async def send(self, *events):
+        """Records down the media stream, in body chunks that cut lines anywhere."""
+        data = ndjson(*events)
+        for start in range(0, len(data), 4000):
+            await self.vm.send_frame(ServiceFrame.body_chunk(self.media, BodyChunk(data=data[start:start + 4000])))
+
+    async def respond(self, stream, status, body=b"", end=False):
+        await self.vm.send_frame(ServiceFrame.response(stream, ApplicationResponse(
+            status=status, body=body, end_body=end)))
+
+    def reply(self, name, response_id, sample, samples):
+        """A reply in records of 0.1 s, counted as sent."""
+        self.log["sent"][name] += samples
+        return [voice(sample, min(TENTH, samples - start), response_id) for start in range(0, samples, TENTH)]
+
+    async def answer_end_call(self):
+        """Answers end-call a moment late, so a half-close sent before the answer would show."""
+        await self.until(lambda: self.end_call is not None, "end-call", 15)
+        await asyncio.sleep(0.3)
+        await self.respond(self.end_call, 200, b'{"ok":true,"result":{"ok":true}}', end=True)
+        self.mark("end_call_answered")
+
+    async def close_down(self):
+        """end-call, then the device's half-close, then the end of the media response."""
+        await self.answer_end_call()
+        await self.until(lambda: self.log["half_close"] is not None, "half-close", 10)
+        await self.vm.send_frame(ServiceFrame.body_chunk(self.media, BodyChunk(data=b"", end_body=True)))
+        self.mark("media_ended")
+
+    async def script(self):
+        await self.until(lambda: self.log["offer"], "admission and offer")
+        if args.call_reject:
+            await self.respond(self.media, 403, b'{"error":"not now"}', end=True)
+            self.mark("head")
+            return await self.answer_end_call()
+        await self.respond(self.media, 200)
+        self.mark("head")
+        # Zeros before readiness, and after it before any real audio, are keepalives.
+        await self.send({"type": "session.created"}, KEEPALIVE, KEEPALIVE)
+        await asyncio.sleep(0.5)
+        self.ready = True
+        await self.send({"type": "hatch.voice.session", "call_id": self.log["admission"]["call_id"],
+                         "session_id": "s1", "thread_id": "t1"}, KEEPALIVE, KEEPALIVE)
+        self.mark("session")
+        if args.call_dead:
+            await asyncio.sleep(0.1)
+            await self.send({"type": "error", "error": {"code": "session_dead", "message": "synthetic"}})
+            return await self.close_down()
+        await self.until(lambda: self.talked(1), "talk")
+        # The start of the reply comes before the turn that confirms it, so it is held.
+        await self.send(speech("started", "i1"), speech("stopped", "i1"), response("created", "r1"),
+                        *self.reply("p1", "r1", FIRST_REPLY, 4 * TENTH), turn("m1", "i1"))
+        if args.call_barge:
+            return await self.barge()
+        # Zeros behind more than a second of queued speech only add delay.
+        await self.send(*self.reply("p1", "r1", FIRST_REPLY, 15 * TENTH), KEEPALIVE, response("done", "r1"),
+                        settled("m1"), {"type": "conversation.item.added", "item": {
+                            "type": "session_control", "name": " STOP ", "call_id": "ctl-9", "arguments": "{}"}})
+        self.goodbye_at = time.monotonic()
+        await self.close_down()
+
+    async def barge(self):
+        """The first reply plays in real time until the device interrupts it."""
+        for _ in range(100):
+            if self.log["cancels"]:
+                break
+            await self.send(*self.reply("p1", "r1", FIRST_REPLY, TENTH))
+            await asyncio.sleep(0.1)
+        else:
+            raise TimeoutError("no cancel")
+        await self.send(*self.reply("stale", "r1", FIRST_REPLY, 3 * TENTH), response("done", "r1", "cancelled"),
+                        settled("m1"), speech("started", "i2"))
+        await self.until(lambda: self.talked(2), "second talk")
+        await self.send(speech("stopped", "i2"), response("created", "r2"),
+                        *self.reply("p2", "r2", SECOND_REPLY, 3 * TENTH), turn("m2", "i2"),
+                        *self.reply("p2", "r2", SECOND_REPLY, 6 * TENTH), response("done", "r2"), settled("m2"))
+        await self.close_down()
+
+
+async def call_handler(ws):
+    vm = Vm(ws)
+    call = Call(vm)
+    transcript["call"] = call.log
+    reader = None
+    try:
+        await vm.handshake()
+        call_open.set()
+        reader = asyncio.create_task(call.read())
+        await asyncio.wait_for(call.script(), 60)
+        await asyncio.wait_for(ws.wait_closed(), 15)
+        call.mark("closed")
+    except Exception as error:
+        call.log["error"] = call.log["error"] or repr(error)
+    finally:
+        if reader and not reader.done():
+            reader.cancel()
+        call_done.set()
+
+
 async def vm_handler(ws):
+    if "app_id=hatch-web" in ws.request.path:
+        return await call_handler(ws)
     transcript["connections"] += 1
     dead = args.dead and transcript["connections"] == 1
     log = transcript["dead_vm"] if dead else transcript["vm"]
@@ -270,7 +531,15 @@ async def vm_handler(ws):
         await asyncio.sleep(DEAD_SECONDS)
         return
 
-    await vm.wait_for_asks()
+    if CALL:
+        # A command while the call is up shows the link session is still served.
+        await asyncio.wait_for(call_open.wait(), 30)
+        await vm.send_message({"method": "link.invoke", "id": "inv-call", "command": "badge.show_message",
+                               "params": {"text": "on a call"}})
+        transcript["invoke_during_call"] = {"result": await vm.next_message(), "call_up": not call_done.is_set()}
+        await asyncio.wait_for(call_done.wait(), 90)
+    else:
+        await vm.wait_for_asks()
 
     await vm.send_message({"method": "link.invoke", "id": "inv-2", "command": "echo",
                            "params": {"text": BIG_TEXT}})

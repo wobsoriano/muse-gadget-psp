@@ -2,19 +2,28 @@
 //! one thread, the way the PSP app drives it.
 //!
 //! Usage: session API_PORT VM_PORT STATE_DIR [--voice] [--save-fails=N] [--until-unreachable] [--tls=CA_DER]
+//!                [--call | --call-barge | --call-reject | --call-dead]
 //!
 //! With `--tls` every connection is TLS to "localhost", checked against the
 //! one authority in CA_DER. Without it they are plaintext.
 //!
+//! With a call flag no questions are asked. Once connected the driver calls
+//! Muse with a fake microphone and speaker, and ends ok on the end the fake's
+//! scenario leads to, followed by the fake's unpair.
+//!
 //! Prints what the client reported as one JSON array on the last line.
 
-use muse_link::{App, Client, Clock, Config, Event, Lost, Net, NotSaved, Pairing, Poll, Refused, Security, State, Stream, Vault, Wire};
+use muse_link::{
+    App, CallAudio, CallState, Client, Clock, Config, Ended, Event, Heard, Lost, Net, NotSaved, Pairing, Poll, Refused, Security, State, Stream,
+    Vault, Wire, CALL_RATE,
+};
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::time_provider::TimeProvider;
 use rustls::{ClientConfig, RootCertStore};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -25,6 +34,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const WAV_BYTES: usize = 100 * 1024;
 const ASK_ATTEMPTS: u32 = 4;
 const LONGEST_RUN: Duration = Duration::from_secs(150);
+const MIC_RATE: u32 = 22_050;
+const MIC_CHUNK: usize = 512;
+/// The speaker's queue: 10 s, as on the PSP.
+const SPEAKER_ROOM: usize = CALL_RATE as usize * 10;
+/// Every sample of the fake's first reply, and of its second.
+const FIRST_REPLY: i16 = 1111;
+const SECOND_REPLY: i16 = 2222;
+/// How much of the first reply plays before the barge-in press: 0.3 s.
+const PLAYED_BEFORE_BARGE: usize = CALL_RATE as usize * 3 / 10;
 
 type Events = Rc<RefCell<Vec<Value>>>;
 
@@ -129,9 +147,153 @@ impl Vault for Files {
     }
 }
 
+/// What the fake speaker was given, in order.
+enum Sound {
+    /// This many samples of one value, queued to play.
+    Play(i16, usize),
+    Flush,
+}
+
+/// What the driver and the call's fake audio share.
+#[derive(Default)]
+struct Room {
+    /// When the call went live.
+    live_at: Option<Instant>,
+    sounds: Vec<Sound>,
+    /// Samples of the first reply the speaker has played out.
+    first_reply_played: usize,
+    /// Samples queued and not yet played, as of the speaker's last look.
+    queued: usize,
+}
+
+impl Room {
+    fn queue(&mut self, pcm: &[i16]) {
+        for &sample in pcm {
+            match self.sounds.last_mut() {
+                Some(Sound::Play(value, count)) if *value == sample => *count += 1,
+                _ => self.sounds.push(Sound::Play(sample, 1)),
+            }
+        }
+    }
+
+    fn heard(&self, sample: i16) -> bool {
+        self.sounds.iter().any(|sound| matches!(sound, Sound::Play(value, _) if *value == sample))
+    }
+
+    fn to_json(&self) -> Value {
+        let sounds = self.sounds.iter().map(|sound| match sound {
+            Sound::Play(value, count) => json!(["play", value, count]),
+            Sound::Flush => json!(["flush"]),
+        });
+        Value::Array(sounds.collect())
+    }
+}
+
+/// A microphone and a speaker that keep real time. The mic hears a 440 Hz
+/// tone from 0.3 s after the call is live, with the talk button down for the
+/// first second of it and the tone going on for half a second more. With
+/// `barge` the button goes down again for 0.6 s, with the tone for 1.1 s,
+/// once 0.3 s of the first reply has played.
+struct FakeAudio {
+    room: Rc<RefCell<Room>>,
+    barge: bool,
+    started: Instant,
+    /// Captures taken so far.
+    taken: u64,
+    /// When the barge-in press came, from when the call went live.
+    pressed_again: Option<Duration>,
+    queue: VecDeque<i16>,
+    /// Speaker samples due by the speaker's last look.
+    drained: u64,
+}
+
+impl FakeAudio {
+    fn new(room: Rc<RefCell<Room>>, barge: bool) -> FakeAudio {
+        FakeAudio { room, barge, started: Instant::now(), taken: 0, pressed_again: None, queue: VecDeque::new(), drained: 0 }
+    }
+
+    fn speaker_due(&self) -> u64 {
+        (self.started.elapsed().as_secs_f64() * f64::from(CALL_RATE)) as u64
+    }
+
+    /// Plays out what is due by now. A speaker with nothing to play lets the
+    /// time go by.
+    fn drain(&mut self) {
+        let due = self.speaker_due();
+        let count = ((due - self.drained) as usize).min(self.queue.len());
+        self.drained = due;
+        let first_reply = self.queue.drain(..count).filter(|&sample| sample == FIRST_REPLY).count();
+        let mut room = self.room.borrow_mut();
+        room.first_reply_played += first_reply;
+        room.queued = self.queue.len();
+    }
+
+    /// Whether the button is down and whether the tone sounds, for a capture
+    /// made `at` after the mic started.
+    fn script(&mut self, at: Duration) -> (bool, bool) {
+        let room = self.room.borrow();
+        let Some(since_live) = room.live_at.and_then(|live| (self.started + at).checked_duration_since(live)) else { return (false, false) };
+        if self.barge && self.pressed_again.is_none() && room.first_reply_played >= PLAYED_BEFORE_BARGE {
+            self.pressed_again = Some(since_live);
+        }
+        let within = |from: Duration, seconds: f64| since_live >= from && since_live < from + Duration::from_secs_f64(seconds);
+        let first = Duration::from_millis(300);
+        let again = self.pressed_again;
+        let talking = within(first, 1.0) || again.is_some_and(|press| within(press, 0.6));
+        let tone = within(first, 1.5) || again.is_some_and(|press| within(press, 1.1));
+        (talking, tone)
+    }
+}
+
+impl CallAudio for FakeAudio {
+    fn mic_rate(&self) -> u32 {
+        MIC_RATE
+    }
+
+    /// A capture every 512 samples of wall time, as a real mic makes them.
+    fn heard(&mut self, into: &mut [i16]) -> Option<Heard> {
+        self.drain();
+        let due = (self.started.elapsed().as_secs_f64() * f64::from(MIC_RATE)) as u64 / MIC_CHUNK as u64;
+        if self.taken >= due {
+            return None;
+        }
+        let first = self.taken * MIC_CHUNK as u64;
+        let (talking, tone) = self.script(Duration::from_secs_f64(first as f64 / f64::from(MIC_RATE)));
+        for (n, sample) in (first..).zip(&mut into[..MIC_CHUNK]) {
+            let phase = 2.0 * std::f64::consts::PI * 440.0 * n as f64 / f64::from(MIC_RATE);
+            *sample = if tone { (8000.0 * phase.sin()) as i16 } else { 0 };
+        }
+        self.taken += 1;
+        Some(Heard { samples: MIC_CHUNK, talking, behind: ((due - self.taken) * MIC_CHUNK as u64) as usize })
+    }
+
+    fn play(&mut self, pcm: &[i16]) -> usize {
+        self.drain();
+        let fit = pcm.len().min(SPEAKER_ROOM - self.queue.len());
+        self.queue.extend(&pcm[..fit]);
+        let mut room = self.room.borrow_mut();
+        room.queue(&pcm[..fit]);
+        room.queued = self.queue.len();
+        fit
+    }
+
+    fn flush(&mut self) {
+        self.queue.clear();
+        let mut room = self.room.borrow_mut();
+        room.sounds.push(Sound::Flush);
+        room.queued = 0;
+    }
+
+    fn queued(&self) -> usize {
+        self.queue.len().saturating_sub((self.speaker_due() - self.drained) as usize)
+    }
+}
+
 #[derive(Default)]
 struct Driver {
     events: Events,
+    room: Rc<RefCell<Room>>,
+    call: Option<CallState>,
     state: Option<State>,
     asks_done: u32,
     /// The reply as last reported before the question ended.
@@ -171,7 +333,13 @@ impl App for Driver {
                 self.record(json!(["ask_failed", why, text]));
                 self.ended = Some(false);
             }
-            Event::Call(state) => self.record(json!(["call", format!("{state:?}")])),
+            Event::Call(state) => {
+                if let CallState::Live { .. } = state {
+                    self.room.borrow_mut().live_at.get_or_insert_with(Instant::now);
+                }
+                self.call = Some(state);
+                self.record(json!(["call", format!("{state:?}")]));
+            }
         }
     }
 
@@ -212,13 +380,20 @@ enum Question {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [api_port, vm_port, state_dir, flags @ ..] = args.as_slice() else {
-        eprintln!("usage: session API_PORT VM_PORT STATE_DIR [--voice] [--save-fails=N] [--until-unreachable] [--tls=CA_DER]");
+        eprintln!(
+            "usage: session API_PORT VM_PORT STATE_DIR [--voice] [--save-fails=N] [--until-unreachable] [--tls=CA_DER] [--call | --call-barge | --call-reject | --call-dead]"
+        );
         std::process::exit(2);
     };
     let flag = |name: &str| flags.iter().any(|flag| flag == name);
     let save_fails = flags.iter().find_map(|flag| flag.strip_prefix("--save-fails=")).map_or(0, |count| count.parse().unwrap());
 
-    let mut questions = vec![Question::Text("what is up"), Question::Text("and now")];
+    let scenarios = [("--call", Ended::Goodbye), ("--call-barge", Ended::HungUp), ("--call-reject", Ended::Refused(403)), ("--call-dead", Ended::Failed)];
+    let scenario = scenarios.into_iter().find(|(name, _)| flag(name));
+    let mut questions = match scenario {
+        Some(_) => vec![],
+        None => vec![Question::Text("what is up"), Question::Text("and now")],
+    };
     if flag("--voice") {
         questions.push(Question::Voice);
     }
@@ -246,17 +421,34 @@ fn main() {
 
     let mut attempts = 0;
     let mut waiting = false;
+    let (mut called, mut hung_up) = (false, false);
     let ok = loop {
         if started.elapsed() > LONGEST_RUN {
             break false;
         }
         match client.poll(&mut driver, 20) {
-            Poll::Unpaired => break questions.peek().is_none(),
+            Poll::Unpaired => break questions.peek().is_none() && scenario.is_none_or(|(_, end)| driver.call == Some(CallState::Ended(end))),
             Poll::Resting(ms) => std::thread::sleep(Duration::from_millis(u64::from(ms.min(50)))),
             Poll::Active => {}
         }
         if flag("--until-unreachable") && matches!(driver.state, Some(State::Unreachable(_))) {
             break true;
+        }
+        if let Some((name, _)) = scenario {
+            if !called && driver.state == Some(State::Connected) {
+                if let Err(refused) = client.call(Box::new(FakeAudio::new(driver.room.clone(), name == "--call-barge"))) {
+                    driver.record(json!(["call_refused", format!("{refused:?}")]));
+                    break false;
+                }
+                called = true;
+            }
+            // Hangs up once the second reply has played out and Muse has nothing in hand.
+            let played_out = driver.room.borrow().heard(SECOND_REPLY) && driver.room.borrow().queued == 0;
+            if name == "--call-barge" && !hung_up && played_out && matches!(driver.call, Some(CallState::Live { working: false, .. })) {
+                client.hang_up();
+                hung_up = true;
+                driver.record(json!(["hang_up"]));
+            }
         }
         if waiting {
             match driver.ended.take() {
@@ -295,6 +487,9 @@ fn main() {
             }
         }
     };
+    if scenario.is_some() {
+        driver.record(json!(["call_audio", driver.room.borrow().to_json()]));
+    }
     println!("{}", Value::Array(events.take()));
     std::process::exit(if ok { 0 } else { 1 });
 }

@@ -3,18 +3,22 @@
     uv run --with pytest --with cryptography --with websockets pytest tests/test_rust_session.py -v
 
 The first three tests cover a session, a voice note and a dead connection.
-The rest cover the edges: commands on the chat stream, a refused door, lost
-tokens, and what the app is told when Muse cannot be reached.
+Then come the edges: commands on the chat stream, a refused door, lost
+tokens, and what the app is told when Muse cannot be reached. The last four
+are a realtime voice call beside the session.
 """
 
+import datetime
 import hashlib
 import json
 import os
 import pathlib
+import re
 import socket
 import struct
 import subprocess
 import sys
+import uuid
 
 import pytest
 
@@ -22,6 +26,9 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 WAV_BYTES = 100 * 1024
 DEVICE = "homelink-010203"
 FILE_LINE = "[file:"
+CALL_PATH = "/v1/noise?vm_id=vm%201&app_id=hatch-web"
+TENTH = 2400  # samples in 0.1 s at 24 kHz
+STAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z")
 
 
 @pytest.fixture(scope="session")
@@ -306,3 +313,149 @@ def test_a_certificate_from_a_stranger_is_unreachable(driver, tmp_path):
 
     assert named(events) == [["state", "connecting"], ["state", "unreachable", "Security"]]
     assert not (tmp_path / "pairing.json").exists()
+
+
+def call_states(events):
+    states = [e[1] for e in events if e[0] == "call"]
+    assert all(a != b for a, b in zip(states, states[1:])), "each change is told once: %s" % states
+    assert not [state for state in states if "weak: true" in state], "a local call never falls behind"
+    return states
+
+
+def phases(states):
+    """Each state once in a row, with Live's details left out."""
+    names = [state.split(" ")[0] for state in states]
+    return [name for at, name in enumerate(names) if at == 0 or names[at - 1] != name]
+
+
+def sounds(events):
+    """What the speaker was given, in order: ["play", sample, count] and ["flush"]."""
+    [audio] = [e[1] for e in events if e[0] == "call_audio"]
+    return audio
+
+
+def played(audio, sample):
+    return sum(entry[2] for entry in audio if entry[:2] == ["play", sample])
+
+
+def in_order(order, *milestones):
+    assert [m for m in order if m in milestones] == list(milestones), order
+
+
+def check_call_opened(call):
+    assert call["error"] is None
+    assert call["unexpected"] == [], "only the call's own requests and records, no /link-control or link.register"
+    assert (call["path"], call["authorization"]) == (CALL_PATH, "Bearer vmtok"), "the link's VM and bearer"
+    call_id = call["admission"]["call_id"]
+    assert uuid.UUID(call_id).version == 4
+    assert call["media_request"] == {"path": "/voice/realtime?call_id=" + call_id, "body": "", "end_body": False,
+                                     "headers": {"Content-Type": "application/x-ndjson; charset=utf-8"}}
+    assert call["admission"] == {"type": "hatch.voice.call.start", "call_id": call_id, "device": "mcu-wearable",
+                                 "device_id": DEVICE, "call_media_type": "audio", "proactive_greeting_enabled": False}
+    assert call["offer"] == {"type": "hatch.voice.capability.offer", "end_call_stop": 1}
+    assert call["early_appends"] == 0, "nothing goes up before readiness"
+    assert call["bad_appends"] == 0, "every append is 960 samples"
+    assert call["commits"] == 0, "the server's speech detection owns the turns"
+    assert call["after_end_call"] == 0, "the uplink stops once end-call goes out"
+
+
+def check_end_call(call, thread_id="t1"):
+    [end_call] = call["end_calls"]
+    assert end_call["headers"] == {"Content-Type": "application/json"} and end_call["end_body"]
+    body = end_call["body"]
+    assert set(body) == {"call_id", "call_started_at", "call_ended_at"} | ({"thread_id"} if thread_id else set())
+    assert body["call_id"] == call["admission"]["call_id"]
+    assert body.get("thread_id") == thread_id
+    assert STAMP.fullmatch(body["call_started_at"]) and STAMP.fullmatch(body["call_ended_at"])
+    started, ended = (datetime.datetime.fromisoformat(body[key].replace("Z", "+00:00"))
+                      for key in ("call_started_at", "call_ended_at"))
+    assert datetime.timedelta(milliseconds=1) <= ended - started < datetime.timedelta(seconds=60)
+    assert abs(datetime.datetime.now(datetime.timezone.utc) - started) < datetime.timedelta(minutes=2)
+
+
+def check_link_beside_the_call(events, transcript):
+    check_vm(transcript["vm"])
+    assert transcript["vm"][4] == {"big_result_ok": True, "big_echo_matches": True}, "the link session kept serving"
+    assert transcript["invoke_during_call"] == {"call_up": True, "result": {
+        "method": "link.result", "id": "inv-call", "ok": True, "payload": {"shown": "on a call"}}}, "even during the call"
+    assert transcript["connections"] == 1
+    check_logs(events)
+    states = [e for e in events if e[0] in ("call", "state")]
+    assert states[-2][0] == "call" and states[-1] == ["state", "unpaired"], "the call ended before the unpair"
+
+
+def test_call(driver, tmp_path):
+    events, transcript = run_session(driver, tmp_path, ["--call"], ["--call"])
+
+    call = transcript["call"]
+    check_call_opened(call)
+    assert call["order"] == ["media_request", "admission", "offer", "head", "session", "append", "end_call",
+                             "end_call_answered", "half_close", "media_ended", "closed"]
+    # A 1 s talk and its 120 ms tail at 40 ms a record, then exact zeros until Muse's goodbye.
+    appends = call["appends"]
+    assert re.fullmatch(r"z+L+z+", appends), appends
+    assert abs(appends.count("L") - 28) <= 3, appends
+    assert 22 <= (len(appends) - 1) / call["appending"] <= 28, "about 25 records a second, paced by the mic"
+    assert call["half_close"] == 0, "the half-close is an empty body"
+    assert (call["cancels"], call["resets"]) == ([], [])
+    check_end_call(call)
+
+    audio = sounds(events)
+    assert played(audio, 0) == 0, "no keepalive zeros played"
+    assert played(audio, 1111) == call["sent"]["p1"] == 19 * TENTH, "the reply, its held start included, in full"
+    # The reply was still playing when Muse said goodbye. Its 1.9 s play out
+    # before end-call, which waits 5 s at most.
+    assert 1.5 <= call["goodbye_to_end_call"] <= 6, call["goodbye_to_end_call"]
+    assert phases(call_states(events)) == ["Dialing", "Live", "Ending", "Ended(Goodbye)"]
+    assert "call over, end-call acknowledged: 0 advisory errors, 0 lines too long, 0 bad audio, 0 stray frames, " \
+           "0 samples with no room, 0 ms of mic skipped" in [e[1] for e in events if e[0] == "log"]
+    check_link_beside_the_call(events, transcript)
+
+
+def test_call_barge_in(driver, tmp_path):
+    events, transcript = run_session(driver, tmp_path, ["--call-barge"], ["--call-barge"])
+
+    call = transcript["call"]
+    check_call_opened(call)
+    in_order(call["order"], "session", "append", "cancel", "end_call", "end_call_answered", "half_close",
+             "media_ended", "closed")
+    assert call["cancels"] == ["r1"], "the press cancels the reply it interrupts, once"
+    assert re.fullmatch(r"z+L+z+L+z+", call["appends"]), call["appends"]
+    check_end_call(call)
+
+    audio = sounds(events)
+    first_reply = next(at for at, entry in enumerate(audio) if entry[:2] == ["play", 1111])
+    interrupted = audio.index(["flush"], first_reply)
+    assert played(audio[:interrupted], 1111) >= 3 * TENTH, "the first reply played until the press"
+    assert played(audio[interrupted:], 1111) == 0, "no stale r1 sample after the flush"
+    assert played(audio, 2222) == call["sent"]["p2"] == 9 * TENTH, "the second reply, its held start included"
+    assert played(audio, 0) == 0
+    assert ["hang_up"] in events
+    assert phases(call_states(events)) == ["Dialing", "Live", "Ending", "Ended(HungUp)"]
+    check_link_beside_the_call(events, transcript)
+
+
+def test_call_refused(driver, tmp_path):
+    events, transcript = run_session(driver, tmp_path, ["--call-reject"], ["--call-reject"])
+
+    call = transcript["call"]
+    check_call_opened(call)
+    # It may have been admitted on the way, so end-call still goes out. The
+    # refusal ended the media, so there is nothing to half-close.
+    assert call["order"] == ["media_request", "admission", "offer", "head", "end_call", "end_call_answered", "closed"]
+    assert call["appends"] == ""
+    check_end_call(call, thread_id=None)
+    assert sounds(events) == []
+    assert phases(call_states(events)) == ["Dialing", "Ending", "Ended(Refused(403))"]
+    check_link_beside_the_call(events, transcript)
+
+
+def test_call_session_dead(driver, tmp_path):
+    events, transcript = run_session(driver, tmp_path, ["--call-dead"], ["--call-dead"])
+
+    call = transcript["call"]
+    check_call_opened(call)
+    in_order(call["order"], "head", "session", "end_call", "end_call_answered", "half_close", "media_ended", "closed")
+    check_end_call(call)
+    assert phases(call_states(events)) == ["Dialing", "Live", "Ending", "Ended(Failed)"]
+    check_link_beside_the_call(events, transcript)
