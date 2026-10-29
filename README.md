@@ -177,7 +177,7 @@ speaks as it does for a voice note.
 | A grey light and "START to call" | Call mode, with no call. Press START. |
 | A blinking amber light and "calling" | Reaching Muse. This takes a few seconds. |
 | A green light and "on call 1:23" | Muse is on the line. Hold R to talk. |
-| An amber light and "on call 1:23" | The upload fell behind, and the app dropped some of your audio |
+| An amber light and "on call 1:23" | The upload is more than 8 s behind, and the app is dropping some of your audio |
 | An amber light and "hanging up" | The call is ending |
 | A grey light and "call ended" | You or Muse hung up, or the call reached a limit |
 | A red light and "no answer", "call refused", "call lost" or "call failed" | The call did not start, or it broke |
@@ -262,10 +262,12 @@ its signal strength, which is the first thing to check.
 - **Long answers get cut short.** The PSP speaks about the first 420
   characters of an answer to a voice note.
 - **For a voice note Muse sends text, not audio.** OpenAI makes the voice.
-- **Calls are an experiment.** A call needs about 64 KB/s each way without a
-  break, which is at the edge of what this PSP's radio managed beside the
-  router. When the upload falls behind, the app drops some of your audio and
-  the light turns amber. A weak signal ends the call, not the app.
+- **Calls are an experiment.** While you hold R, and for a second after, the
+  call uploads about 64 KB/s, which is more than this PSP's radio managed
+  beside the router. Between turns it uploads nothing, but Muse's side sends
+  about 64 KB/s all call long. When the upload falls behind, your words reach
+  Muse late and whole, up to 8 s late. Past that the app drops some of your
+  audio and the light turns amber. A weak signal ends the call, not the app.
 
 ## License
 

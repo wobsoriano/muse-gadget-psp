@@ -12,7 +12,7 @@ mod uplink;
 use self::gate::{Gate, Turns, Verdict};
 use self::record::{Down, Id};
 use self::stage::{Act, Input, Limits, Stage};
-use self::uplink::{Edge, Uplink, SEND_PER_STEP};
+use self::uplink::{Edge, Uplink};
 use crate::channel::{Fault, Security};
 use crate::client::{App, Event};
 use crate::connection::{Answer, Connection, Hello, Next};
@@ -51,8 +51,6 @@ pub struct Heard {
     /// Whether the talk button was down while it was captured. The one place
     /// a call learns about the button.
     pub talking: bool,
-    /// Samples captured after it and still waiting: how far behind the call is.
-    pub behind: usize,
 }
 
 /// Where a call stands, for the screen.
@@ -99,9 +97,9 @@ const LARGEST_CAPTURE: usize = 1024;
 const LARGEST_LINE: usize = 260 * 1024;
 /// Audio that waits for its turn to be confirmed: 5 s.
 const MOST_HELD: usize = CALL_RATE as usize * 5;
-const LAG_SKIP_AT_MS: u64 = 1_500;
-const LAG_KEEP_MS: u64 = 250;
 const WEAK_FOR_MS: u64 = 5_000;
+/// How often the uplink says how it is doing, in the log.
+const REPORT_EVERY_MS: u64 = 1_000;
 /// Zeros kept past this much queued would only add delay.
 const MOST_QUEUED_SILENCE: usize = CALL_RATE as usize;
 const AUDIBLE_PEAK: u16 = 256;
@@ -147,8 +145,6 @@ struct Counts {
     stray_frames: u32,
     /// Samples of Muse's voice that found no room.
     overflowed: usize,
-    /// Microphone samples thrown away because the call fell behind.
-    skipped_mic: usize,
 }
 
 pub(crate) struct Call<W: Wire> {
@@ -160,8 +156,9 @@ pub(crate) struct Call<W: Wire> {
     device_id: String,
     stage: Stage,
     limits: Limits,
-    /// Stages entered since the app was last told, for its log.
-    moves: Vec<Stage>,
+    /// Lines for the app's log since it was last told: stages entered, the
+    /// server's events, and how the uplink is doing.
+    notes: Vec<String>,
     media: Media,
     end_call: Option<(i64, Answer)>,
     gate: Gate,
@@ -175,8 +172,9 @@ pub(crate) struct Call<W: Wire> {
     started_ms: u64,
     started_unix_ms: u64,
     weak_until_ms: u64,
-    /// Throwing captures away until little is left behind.
-    skipping: bool,
+    reported_ms: u64,
+    /// Frames the uplink had sent at the last report.
+    reported_frames: usize,
     hang_up: bool,
     told: Option<CallState>,
     counts: Counts,
@@ -195,7 +193,7 @@ impl<W: Wire> Call<W> {
             device_id: device_id.into(),
             stage: Stage::Dialing,
             limits: Limits::default(),
-            moves: Vec::new(),
+            notes: Vec::new(),
             media: Media { stream: 0, up: true, down: true },
             end_call: None,
             gate: Gate::new(),
@@ -207,7 +205,8 @@ impl<W: Wire> Call<W> {
             started_ms: 0,
             started_unix_ms: 0,
             weak_until_ms: 0,
-            skipping: false,
+            reported_ms: 0,
+            reported_frames: 0,
             hang_up: false,
             told: None,
             counts: Counts::default(),
@@ -244,6 +243,7 @@ impl<W: Wire> Call<W> {
                 }
             }
         }
+        self.report(clock.millis());
         self.tell(app, clock.millis());
     }
 
@@ -292,7 +292,7 @@ impl<W: Wire> Call<W> {
 
     fn exchange(&mut self, clock: &impl Clock, wait_ms: u32) -> Result<(), Fault> {
         self.mic(clock.millis());
-        self.send_up()?;
+        self.send_up(clock.millis())?;
         self.read_down(clock, wait_ms)?;
         let now = clock.millis();
         if let Some(conn) = self.conn.as_mut() {
@@ -303,9 +303,8 @@ impl<W: Wire> Call<W> {
         Ok(())
     }
 
-    /// Takes what the mic heard while the uplink wants more. Only a live
-    /// call sends it. Before and after, it is taken and thrown away, so the
-    /// app's ring never fills.
+    /// Takes everything the mic heard, so the app's ring never fills. Only a
+    /// live call keeps any of it.
     fn mic(&mut self, now: u64) {
         let mut capture = [0i16; LARGEST_CAPTURE];
         let live = matches!(self.stage, Stage::Live { .. });
@@ -315,31 +314,24 @@ impl<W: Wire> Call<W> {
                 continue;
             }
             let samples = heard.samples.min(capture.len());
-            let behind_ms = heard.behind as u64 * 1000 / u64::from(self.mic_rate);
-            self.skipping = behind_ms > LAG_SKIP_AT_MS || self.skipping && behind_ms > LAG_KEEP_MS;
-            let edge = if self.skipping {
+            let edge = self.uplink.hear(&capture[..samples], heard.talking);
+            if self.uplink.skipping() {
                 self.weak_until_ms = now + WEAK_FOR_MS;
-                self.counts.skipped_mic += samples;
-                self.uplink.skip(samples, heard.talking)
-            } else {
-                self.uplink.hear(&capture[..samples], heard.talking)
-            };
+            }
             if edge == Some(Edge::Pressed) {
                 self.cancel = self.gate.press().or(self.cancel.take());
                 self.apply_flush();
             }
             talked |= heard.talking;
-            if !self.uplink.hungry() {
-                break;
-            }
         }
         if talked {
             self.feed(Input::Activity, now);
         }
     }
 
-    /// The cancel first, then whole frames, each built and sealed here.
-    fn send_up(&mut self) -> Result<(), Fault> {
+    /// The cancel first, then the frames the uplink lets go now, each built
+    /// and sealed here.
+    fn send_up(&mut self, now: u64) -> Result<(), Fault> {
         if !matches!(self.stage, Stage::Live { .. }) {
             self.cancel = None;
             self.uplink.discard();
@@ -349,8 +341,7 @@ impl<W: Wire> Call<W> {
         if let Some(open) = self.cancel.take() {
             conn.send(self.media.stream, Part::Body { data: &record::cancel(&open), end: false })?;
         }
-        for _ in 0..SEND_PER_STEP {
-            let Some(line) = self.uplink.next_line() else { break };
+        while let Some(line) = self.uplink.next_line(now) {
             conn.send(self.media.stream, Part::Body { data: line, end: false })?;
         }
         Ok(())
@@ -443,7 +434,11 @@ impl<W: Wire> Call<W> {
     }
 
     fn on_line(&mut self, line: &[u8], now: u64) {
-        match (self.stage, record::parse(line)) {
+        let down = record::parse(line);
+        if !matches!(down, Down::Audio { .. } | Down::BadAudio | Down::Other) {
+            self.notes.push(format!("call: heard {down:?}"));
+        }
+        match (self.stage, down) {
             (Stage::Ringing { .. }, Down::Session { call_id, thread_id, .. }) if call_id.as_str() == self.call_id => {
                 self.thread_id = thread_id;
                 self.feed(Input::Ready, now);
@@ -562,9 +557,27 @@ impl<W: Wire> Call<W> {
 
     fn enter(&mut self, next: Stage) {
         if core::mem::discriminant(&next) != core::mem::discriminant(&self.stage) {
-            self.moves.push(next);
+            self.notes.push(format!("call: {next:?}"));
         }
         self.stage = next;
+    }
+
+    /// Once a second while live, how the uplink is doing, unless it has
+    /// nothing to do.
+    fn report(&mut self, now_ms: u64) {
+        if !matches!(self.stage, Stage::Live { .. }) || now_ms.saturating_sub(self.reported_ms) < REPORT_EVERY_MS {
+            return;
+        }
+        let frames = self.uplink.frames_sent();
+        let behind_ms = self.uplink.behind_ms();
+        if frames != self.reported_frames || behind_ms > 0 {
+            self.notes.push(format!("call: {} frames up, {behind_ms} ms behind, {} ms skipped in all", frames - self.reported_frames, self.skipped_ms()));
+        }
+        (self.reported_ms, self.reported_frames) = (now_ms, frames);
+    }
+
+    fn skipped_ms(&self) -> u64 {
+        self.uplink.skipped() as u64 * 1000 / u64::from(self.mic_rate)
     }
 
     fn act(&mut self, act: Act, now: u64) -> Result<(), Fault> {
@@ -611,8 +624,8 @@ impl<W: Wire> Call<W> {
     }
 
     fn tell(&mut self, app: &mut impl App, now_ms: u64) {
-        for stage in self.moves.drain(..) {
-            log!(app, "call: {stage:?}");
+        for note in self.notes.drain(..) {
+            log!(app, "{note}");
         }
         let state = self.state(now_ms);
         if self.told == Some(state) {
@@ -635,7 +648,7 @@ impl<W: Wire> Call<W> {
                 counts.bad_audio,
                 counts.stray_frames,
                 counts.overflowed,
-                counts.skipped_mic as u64 * 1000 / u64::from(self.mic_rate)
+                self.skipped_ms()
             );
         }
         app.event(Event::Call(state));
@@ -877,7 +890,7 @@ mod tests {
     fn a_press_flushes_what_plays_and_cancels_the_open_reply() {
         let mut rig = Rig::at(LIVE);
         rig.hear(&[json!({"type": "response.created", "response": {"id": "r1"}}), audio(Some("r1"), 1111, 100)]);
-        rig.room.borrow_mut().mic.extend([Heard { samples: 512, talking: true, behind: 0 }]);
+        rig.room.borrow_mut().mic.extend([Heard { samples: 512, talking: true }]);
         rig.step();
         rig.hear(&[audio(Some("r1"), 1111, 100)]);
         assert_eq!(rig.played(), samples(1111, 100));
@@ -941,26 +954,22 @@ mod tests {
     #[test]
     fn the_mic_goes_up_only_while_live_and_a_backlog_is_skipped_and_shown() {
         let mut rig = Rig::at(Stage::Ringing { since_ms: 0 });
-        rig.room.borrow_mut().mic.extend([Heard { samples: 512, talking: true, behind: 0 }; 8]);
+        rig.room.borrow_mut().mic.extend([Heard { samples: 512, talking: true }; 8]);
         rig.step();
         assert!(rig.room.borrow().mic.is_empty(), "taken before readiness, so the ring never fills");
-        assert_eq!(rig.call.uplink.next_line(), None, "and nothing goes up");
+        assert_eq!(rig.call.uplink.next_line(u64::MAX), None, "and nothing goes up");
 
         rig.call.stage = LIVE;
-        let behind_by = |ms: u64| (ms * u64::from(MIC_RATE) / 1000) as usize;
-        let just_under_skip = behind_by(LAG_SKIP_AT_MS - 100);
-        let well_past_skip = behind_by(2 * LAG_SKIP_AT_MS);
-        let half_skip = behind_by(LAG_SKIP_AT_MS / 2);
-        let just_over_keep = behind_by(LAG_KEEP_MS + 10);
-        let just_under_keep = behind_by(LAG_KEEP_MS - 10);
-        let none = 0;
-        let behind = [just_under_skip, well_past_skip, half_skip, just_over_keep, just_under_keep, none];
-        rig.room.borrow_mut().mic.extend(behind.map(|behind| Heard { samples: 512, talking: false, behind }));
+        let chunks_in = |seconds: usize| seconds * MIC_RATE as usize / 512;
+        rig.room.borrow_mut().mic.extend(core::iter::repeat_n(Heard { samples: 512, talking: true }, chunks_in(7)));
         rig.step();
-        assert_eq!(rig.call.counts.skipped_mic, 3 * 512);
+        assert_eq!(rig.call.skipped_ms(), 0, "seven seconds of talk wait, with no network to take them");
+        rig.room.borrow_mut().mic.extend(core::iter::repeat_n(Heard { samples: 512, talking: true }, chunks_in(2)));
+        rig.step();
+        assert!((500..=1200).contains(&rig.call.skipped_ms()), "{} ms skipped past eight seconds behind", rig.call.skipped_ms());
         rig.clock.ms.set(rig.clock.ms.get() + WEAK_FOR_MS);
         rig.step();
-        assert_eq!(rig.told.0[1..], [CallState::Live { working: false, weak: true }, QUIET]);
+        assert_eq!(rig.told.0[1..], [QUIET, CallState::Live { working: false, weak: true }, QUIET]);
     }
 
     #[test]

@@ -264,7 +264,7 @@ impl CallAudio for FakeAudio {
             *sample = if tone { (8000.0 * phase.sin()) as i16 } else { 0 };
         }
         self.taken += 1;
-        Some(Heard { samples: MIC_CHUNK, talking, behind: ((due - self.taken) * MIC_CHUNK as u64) as usize })
+        Some(Heard { samples: MIC_CHUNK, talking })
     }
 
     fn play(&mut self, pcm: &[i16]) -> usize {

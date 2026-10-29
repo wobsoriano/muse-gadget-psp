@@ -15,8 +15,8 @@ use psp::sys::{self, AudioOutputFrequency, ThreadAttributes};
 /// Holds the word `call` while the app is in call mode. Voice notes are the
 /// default, so deleting it goes back to them.
 const MODE: &str = "state/mode.txt";
-/// About 3 s of the microphone. A call starts skipping audio once it is 1.5 s
-/// behind, so only a connection thread held up for longer fills it.
+/// About 3 s of the microphone. The call takes all of it every step, so only
+/// a connection thread held up for longer, by a stalled send, fills it.
 const MIC_CHUNKS: usize = 128;
 /// 10.9 s of Muse's voice.
 const SPEAKER_SAMPLES: usize = 1 << 18;
@@ -237,7 +237,7 @@ impl CallAudio for Pipes {
             return None;
         }
         into[..audio::CHUNK].copy_from_slice(&chunk[0].pcm);
-        Some(Heard { samples: audio::CHUNK, talking: chunk[0].talking, behind: MIC.queued() * audio::CHUNK })
+        Some(Heard { samples: audio::CHUNK, talking: chunk[0].talking })
     }
 
     fn play(&mut self, pcm: &[i16]) -> usize {

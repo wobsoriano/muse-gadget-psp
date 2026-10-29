@@ -31,6 +31,7 @@ CALL_RATE = 24000
 SAMPLES_PER_TENTH_SECOND = CALL_RATE // 10
 TALK_MS = 1000
 TAIL_MS = 120
+QUIET_MS = 1000
 APPEND_MS = 40
 FIRST_REPLY_TENTHS = 4 + 15
 GOODBYE_LIMIT_S = 5
@@ -398,8 +399,10 @@ def test_call(driver, tmp_path):
     assert call["order"] == ["media_request", "admission", "offer", "head", "session", "append", "end_call",
                              "end_call_answered", "half_close", "media_ended", "closed"]
     appends = call["appends"]
-    assert re.fullmatch(r"z+L+z+", appends), appends
+    assert re.fullmatch(r"L+z+", appends), "nothing before the press, and a second of quiet after: " + appends
     assert abs(appends.count("L") - (TALK_MS + TAIL_MS) / APPEND_MS) <= 3, appends
+    # Muse says goodbye five quiet frames in, and nothing goes up after that.
+    assert 5 <= appends.count("z") <= QUIET_MS / APPEND_MS + 3, appends
     assert 22 <= (len(appends) - 1) / call["appending"] <= 28, "about 25 records a second, paced by the mic"
     assert call["half_close"] == 0, "the half-close is an empty body"
     assert (call["cancels"], call["resets"]) == ([], [])
@@ -424,7 +427,7 @@ def test_call_barge_in(driver, tmp_path):
     in_order(call["order"], "session", "append", "cancel", "end_call", "end_call_answered", "half_close",
              "media_ended", "closed")
     assert call["cancels"] == ["r1"], "the press cancels the reply it interrupts, once"
-    assert re.fullmatch(r"z+L+z+L+z+", call["appends"]), call["appends"]
+    assert re.fullmatch(r"L+z+L+z+", call["appends"]), call["appends"]
     check_end_call(call)
 
     audio = sounds(events)
