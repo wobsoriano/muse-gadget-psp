@@ -9,6 +9,7 @@ compile_error!("plaintext-for-tests is for the fake server on a computer. The PS
 
 pub mod dns;
 pub mod https;
+pub mod ring;
 pub mod secure;
 pub mod speech;
 pub mod wav;
